@@ -144,7 +144,7 @@ async def format_vip_table(bot) -> str:
     package_status = {}
     for pkg in packages:
         package_status[pkg["id"]] = await _check_bot_admin_status(
-            bot, (pkg.get("target_chat_id") or "").strip(), admin_status_cache
+            bot, (pkg["target_chat_id"] or "").strip(), admin_status_cache
         )
 
     # Lebar kolom (dalam karakter, TIDAK termasuk 1 spasi padding di tiap sisi).
@@ -221,7 +221,7 @@ async def format_vip_table_rich(bot) -> str:
     package_status = {}
     for pkg in packages:
         package_status[pkg["id"]] = await _check_bot_admin_status(
-            bot, (pkg.get("target_chat_id") or "").strip(), admin_status_cache
+            bot, (pkg["target_chat_id"] or "").strip(), admin_status_cache
         )
 
     rows = []
