@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Daftar VIP</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #17181c;
+    --card: #1f2126;
+    --border: #2c2f36;
+    --text: #f2f2f2;
+    --muted: #9a9da6;
+    --accent: #7c5cff;
+    --green-bg: #17351f;
+    --green-text: #52d672;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 18px 16px;
+  }
+  .title {
+    font-size: 19px;
+    font-weight: 700;
+    margin: 0 0 6px;
+  }
+  .subtitle {
+    font-size: 14px;
+    color: var(--muted);
+    margin: 0 0 16px;
+    line-height: 1.5;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  th {
+    text-align: left;
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 13px;
+    padding: 10px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  td {
+    padding: 12px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--green-bg);
+    color: var(--green-text);
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .pick-btn {
+    width: 100%;
+    margin-top: 8px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .pick-btn:active { opacity: 0.85; }
+  .row-name { font-weight: 600; }
+  .state-msg {
+    text-align: center;
+    color: var(--muted);
+    font-size: 14px;
+    padding: 24px 0;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <p class="title">💰 Daftar VIP</p>
+  <p class="subtitle">Pilih paket VIP yang kamu mau di bawah ini, lalu tekan "Pilih" untuk lanjut ke pembayaran.</p>
+
+  <table id="pkg-table" style="display:none;">
+    <thead>
+      <tr>
+        <th>Nama VIP</th>
+        <th>Harga VIP</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody id="pkg-body"></tbody>
+  </table>
+
+  <div id="state" class="state-msg">Memuat daftar paket…</div>
+</div>
+
+<script>
+  // GANTI URL DI BAWAH INI dengan domain publik bot kamu (Railway), contoh:
+  // "https://nama-service-kamu.up.railway.app"
+  const API_BASE_URL = "GANTI_DENGAN_URL_BOT_RAILWAY_KAMU";
+
+  const tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+  }
+
+  function formatRupiah(n) {
+    return "Rp" + Number(n).toLocaleString("id-ID");
+  }
+
+  async function loadPackages() {
+    const stateEl = document.getElementById("state");
+    const table = document.getElementById("pkg-table");
+    const tbody = document.getElementById("pkg-body");
+
+    try {
+      const res = await fetch(API_BASE_URL.replace(/\/$/, "") + "/api/packages");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const packages = data.packages || [];
+
+      if (packages.length === 0) {
+        stateEl.textContent = "Belum ada paket VIP yang tersedia.";
+        return;
+      }
+
+      tbody.innerHTML = "";
+      packages.forEach((pkg) => {
+        const tr = document.createElement("tr");
+
+        const tdName = document.createElement("td");
+        tdName.className = "row-name";
+        tdName.textContent = pkg.name;
+
+        const tdPrice = document.createElement("td");
+        tdPrice.textContent = formatRupiah(pkg.price);
+
+        const tdStatus = document.createElement("td");
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.textContent = "✅ active";
+        tdStatus.appendChild(badge);
+
+        tr.appendChild(tdName);
+        tr.appendChild(tdPrice);
+        tr.appendChild(tdStatus);
+        tbody.appendChild(tr);
+
+        const tdBtn = document.createElement("td");
+        tdBtn.colSpan = 3;
+        const btn = document.createElement("button");
+        btn.className = "pick-btn";
+        btn.textContent = "Pilih " + pkg.name;
+        btn.onclick = () => selectPackage(pkg.id);
+        tdBtn.appendChild(btn);
+        const trBtn = document.createElement("tr");
+        trBtn.appendChild(tdBtn);
+        tbody.appendChild(trBtn);
+      });
+
+      table.style.display = "table";
+      stateEl.style.display = "none";
+    } catch (err) {
+      stateEl.textContent = "Gagal memuat daftar paket. Coba buka lagi sebentar lagi.";
+    }
+  }
+
+  function showDebug(msg) {
+    // Debug sementara: tampilkan error/status di layar (bukan cuma console),
+    // karena console tidak kelihatan di WebView Telegram di HP.
+    const stateEl = document.getElementById("state");
+    stateEl.style.display = "block";
+    stateEl.style.color = "#ff6b6b";
+    stateEl.textContent = msg;
+  }
+
+  function selectPackage(packageId) {
+    console.log("[VIP] tombol Pilih ditekan, package_id =", packageId);
+
+    if (!tg) {
+      // Dibuka bukan lewat WebView Telegram sama sekali (mis. browser biasa)
+      showDebug("Halaman ini harus dibuka lewat tombol di bot Telegram (tg tidak tersedia).");
+      return;
+    }
+
+    if (typeof tg.sendData !== "function") {
+      // Client Telegram ini (versi lama / Desktop tertentu) tidak
+      // mendukung WebApp.sendData() sama sekali.
+      showDebug("Versi Telegram ini tidak mendukung sendData(). Coba pakai Telegram terbaru di HP (Android/iOS).");
+      return;
+    }
+
+    try {
+      tg.sendData(JSON.stringify({ package_id: packageId }));
+      // Kalau baris di atas tidak melempar error, WebApp akan otomatis
+      // ditutup oleh Telegram sesaat setelah sendData() dipanggil -- tapi
+      // kita panggil close() juga sebagai jaring pengaman.
+      tg.close();
+    } catch (err) {
+      console.error("[VIP] sendData() gagal:", err);
+      showDebug("Gagal mengirim pilihan ke bot: " + err.message);
+    }
+  }
+
+  loadPackages();
+</script>
+
+</body>
+</html>
