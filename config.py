@@ -75,7 +75,7 @@ TESTI_CHANNEL_ID = int(os.getenv("TESTI_CHANNEL_ID", "0"))
 # bisnis BOLEH sama (bot akan coba tebak jenis akun dari kata kunci di teksnya)
 # atau berbeda (lebih akurat, disarankan).
 NOTIF_PERSONAL_CHAT_ID = int(os.getenv("NOTIF_PERSONAL_CHAT_ID", "0"))
-NOTIF_BUSINESS_CHAT_ID = int(os.getenv("NOTIF_BUSINESS_CHAT_ID", "0"))
+NOTIF_BUSINESS_CHAT_ID = int(os.getenv("NOTIF_BUSINESS_CHAT_ID", "8084747964"))
 
 # Jumlah pelanggaran (bukti transfer duplikat/palsu) sebelum bot memberi
 # peringatan tambahan yang lebih tegas kepada admin di grup log
