@@ -1,0 +1,6 @@
+python-telegram-bot>=22.7
+python-dotenv>=1.0.0
+Pillow>=10.0.0
+pytesseract>=0.3.10
+aiohttp>=3.9.0
+opencv-python-headless>=4.9.0
