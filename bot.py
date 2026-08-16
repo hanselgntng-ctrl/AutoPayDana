@@ -1,0 +1,4299 @@
+"""
+bot.py
+======
+Bot Telegram VIP dengan auto-approve/reject bukti transfer.
+
+Alur pembayaran:
+1. User /start -> lihat teks sapaan + menu.
+2. User pilih "Lihat Paket VIP" -> tabel paket VIP (custom via /settings).
+3. User pilih salah satu paket -> bot kirim QRIS + nominal unik untuk dibayar.
+4. User upload foto bukti transfer -> bot OCR gambar itu, cocokkan LOKAL ke
+   nama penerima QRIS + tanggal + nominal (verify_proof_locally(), TIDAK ada
+   panggilan ke API/pihak ketiga mana pun).
+5. Kalau cocok -> otomatis APPROVE, VIP langsung aktif, tanpa admin pencet apa pun.
+   Kalau tidak cocok -> otomatis REJECT + alasan, dengan opsi diteruskan ke admin
+   untuk review manual (tombol Approve/Reject, lihat confirm_proof_keyboard()).
+
+Jalankan dengan: python bot.py
+"""
+
+import os
+import io
+import json
+import html
+import time
+import random
+import logging
+import datetime
+import asyncio
+import warnings
+from typing import Optional
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from telegram.constants import ParseMode
+from telegram.error import RetryAfter, BadRequest
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, ConversationHandler, filters,
+)
+from telegram.request import HTTPXRequest
+from telegram.warnings import PTBUserWarning
+from PIL import Image
+
+from easing import Animator, ease_out_cubic, ease_out_elastic, render_bar
+import api_server
+
+# settings_conv (di bawah) sengaja mencampur CallbackQueryHandler (tombol) dan
+# MessageHandler (ketik teks) di dalam state yang sama -> per_message WAJIB False
+# (default), dan PTB akan selalu memunculkan warning FAQ soal ini walau
+# perilakunya sudah sesuai yang kita inginkan (state tetap dilacak per
+# chat/user, hanya bukan per pesan individual -> tidak relevan untuk alur ini).
+# Redam warning spesifik ini saja supaya log tidak berisik, tanpa menyembunyikan
+# warning PTB lain yang mungkin penting.
+warnings.filterwarnings(
+    "ignore", message=r".*per_message.*", category=PTBUserWarning
+)
+
+import config
+import database as db
+import ocr_utils
+import qris_dinamis
+import keyboards as kb
+import stats_broadcast as sb
+import watermark
+import rich_api
+import typing_animation
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ── Tombol berwarna (Bot API 9.4, 9 Feb 2026) ───────────────────────────────
+# Field `style` ("primary"/"success"/"danger") pada InlineKeyboardButton baru
+# didukung oleh python-telegram-bot mulai v22.7. Kalau versi library yang
+# terpasang lebih lama dari itu, meneruskan kwarg `style` langsung ke
+# InlineKeyboardButton() akan melempar TypeError begitu tombol dibuat --
+# ini sebelumnya membuat /broadcast (dan menu lain) gagal total sebelum
+# sempat mengirim apa pun, karena tombol "Batal" di back_kb() sudah crash
+# duluan. make_button() di bawah ini mencoba style dulu, dan kalau library
+# yang terpasang belum mendukungnya, otomatis membuat ulang tombol yang
+# sama TANPA `style` (fungsi tombol tetap jalan, cuma warnanya yang tidak
+# tampil) alih-alih membuat seluruh alur ikut gagal.
+_style_unsupported_warned = False
+
+def make_button(text: str, **kwargs) -> InlineKeyboardButton:
+    """Wrapper aman-versi untuk InlineKeyboardButton(text, ..., style=...)."""
+    global _style_unsupported_warned
+    try:
+        return InlineKeyboardButton(text, **kwargs)
+    except TypeError as e:
+        if "style" in kwargs and "style" in str(e):
+            if not _style_unsupported_warned:
+                logger.warning(
+                    "python-telegram-bot yang terpasang belum mendukung field "
+                    "'style' pada InlineKeyboardButton (baru didukung mulai "
+                    "v22.7, sesuai Bot API 9.4). Tombol akan dibuat tanpa "
+                    "warna. Upgrade dengan: pip install -U python-telegram-bot"
+                )
+                _style_unsupported_warned = True
+            fallback_kwargs = {k: v for k, v in kwargs.items() if k != "style"}
+            return InlineKeyboardButton(text, **fallback_kwargs)
+        raise
+
+# ── Chat bersih (auto-cleanup) ──────────────────────────────────────────────
+# Fitur ini membuat chat PRIBADI antara bot & user selalu "bersih": setiap kali
+# bot mengirim pesan BARU (send_message/send_photo) ke sebuah chat pribadi,
+# SEMUA pesan sebelumnya di chat itu (baik pesan bot maupun pesan user) yang
+# tercatat di tabel db.chat_cleanup otomatis dihapus dulu -- KECUALI foto
+# bukti transfer yang dikirim user, yang SENGAJA tidak pernah dicatat ke
+# tabel itu (lihat track_incoming_message() di bawah) sehingga tidak pernah
+# ikut terhapus.
+#
+# Cuma berlaku untuk chat PRIBADI (chat_id > 0) -- grup/channel (mis. grup
+# log, channel testi, atau channel/grup VIP tujuan paket) TIDAK disentuh sama
+# sekali oleh fitur ini.
+
+
+async def _cleanup_previous_messages(bot, chat_id: int):
+    """Hapus semua pesan yang tercatat "boleh dihapus" untuk `chat_id`
+    (dipanggil tepat SEBELUM bot mengirim pesan baru ke chat itu)."""
+    if not chat_id or chat_id <= 0:
+        return  # bukan chat pribadi (grup/channel id selalu negatif) -> skip
+    try:
+        message_ids = db.pop_cleanup_messages(chat_id)
+    except Exception as e:
+        logger.warning(f"Gagal mengambil daftar pesan cleanup untuk chat {chat_id}: {e}")
+        return
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            # Wajar terjadi -- pesan sudah dihapus manual sebelumnya, sudah
+            # lebih dari 48 jam, atau memang sudah tidak ada. Abaikan saja,
+            # tidak perlu menghentikan pengiriman pesan baru gara-gara ini.
+            pass
+
+
+def install_chat_cleaner(bot):
+    """Pasang wrapper tipis di atas send_message & send_photo supaya SETIAP
+    pemanggilan lewat keduanya (termasuk lewat `update.message.reply_text()`
+    / `reply_photo()`, karena keduanya memanggil method bot yang SAMA di balik
+    layar) otomatis: (1) bersihkan pesan lama chat itu dulu, (2) kirim pesan
+    baru, (3) catat pesan baru itu supaya ikut dibersihkan di pengiriman
+    berikutnya.
+
+    Method `edit_message_text` / `edit_message_caption` (dipakai fade_transition
+    untuk transisi halus) SENGAJA TIDAK dibungkus -- keduanya mengedit pesan
+    yang SUDAH ADA (bukan pesan baru), jadi tidak menambah "sampah" di chat.
+
+    PENTING -- kenapa di-patch di level CLASS (`type(bot)`), BUKAN di level
+    instance (`bot.send_message = ...`): `Bot`/`ExtBot` mewarisi
+    `TelegramObject`, yang API PTB memang SENGAJA membuatnya "frozen" (via
+    `TelegramObject.__setattr__`) supaya attribute baru tidak bisa ditempel
+    langsung ke instance -- mencoba itu berujung `AttributeError` dari
+    `telegram/_telegramobject.py`. Solusinya sama seperti pola yang sudah
+    dipakai typing_animation.py: patch method-nya di CLASS-nya (`setattr(cls,
+    "send_message", wrapper)`), bukan di object instance-nya.
+    """
+    bot_cls = type(bot)
+    original_send_message = bot_cls.send_message
+    original_send_photo = bot_cls.send_photo
+
+    # Jaga-jaga kalau install_chat_cleaner() sengaja/tidak sengaja dipanggil
+    # lebih dari sekali -- supaya tidak dobel-wrap (dobel cleanup & dobel
+    # pencatatan pesan untuk 1x pengiriman yang sama).
+    if getattr(original_send_message, "_is_chat_cleaner_wrapper", False):
+        return
+
+    def _extract_chat_id(args, kwargs):
+        if "chat_id" in kwargs:
+            return kwargs["chat_id"]
+        return args[0] if args else None
+
+    async def send_message(self, *args, **kwargs):
+        chat_id = _extract_chat_id(args, kwargs)
+        await _cleanup_previous_messages(self, chat_id)
+        msg = await original_send_message(self, *args, **kwargs)
+        if chat_id:
+            try:
+                db.add_cleanup_message(chat_id, msg.message_id)
+            except Exception as e:
+                logger.warning(f"Gagal mencatat pesan untuk cleanup (chat {chat_id}): {e}")
+        return msg
+
+    async def send_photo(self, *args, **kwargs):
+        chat_id = _extract_chat_id(args, kwargs)
+        await _cleanup_previous_messages(self, chat_id)
+        msg = await original_send_photo(self, *args, **kwargs)
+        if chat_id:
+            try:
+                db.add_cleanup_message(chat_id, msg.message_id)
+            except Exception as e:
+                logger.warning(f"Gagal mencatat pesan untuk cleanup (chat {chat_id}): {e}")
+        return msg
+
+    send_message._is_chat_cleaner_wrapper = True
+    send_photo._is_chat_cleaner_wrapper = True
+    setattr(bot_cls, "send_message", send_message)
+    setattr(bot_cls, "send_photo", send_photo)
+
+
+
+async def track_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler PALING PERTAMA (group=-1) untuk setiap pesan masuk di chat
+    pribadi -- mencatat pesan itu supaya ikut dibersihkan di pengiriman bot
+    berikutnya, KECUALI kalau pesan itu adalah FOTO BUKTI TRANSFER yang
+    sedang ditunggu untuk transaksi yang masih pending milik user tsb (maka
+    dibiarkan, tidak pernah dicatat -> tidak pernah dihapus otomatis).
+
+    Pengecekan "apakah ini bukti transfer" di sini SENGAJA meniru pengecekan
+    di awal handle_proof_photo() (ada transaksi 'pending' milik user ini) --
+    supaya kedua handler selalu konsisten menganggap foto yang sama sebagai
+    bukti transfer atau bukan.
+    """
+    message = update.effective_message
+    if message is None or message.chat.id <= 0:
+        return  # bukan chat pribadi -> tidak diurus fitur ini
+
+    if message.photo:
+        tx_id = context.user_data.get("pending_tx_id")
+        if not tx_id:
+            tx = db.get_pending_transaction_for_user(update.effective_user.id)
+            tx_id = tx["id"] if tx else None
+        if tx_id:
+            return  # foto ini bukti transfer yang valid -> JANGAN dicatat/dihapus
+
+    try:
+        db.add_cleanup_message(message.chat.id, message.message_id)
+    except Exception as e:
+        logger.warning(f"Gagal mencatat pesan masuk untuk cleanup (chat {message.chat.id}): {e}")
+
+
+# ── Conversation states (untuk menu /settings admin) ───────────────────────
+(
+    SET_GREETING, SET_VIP_TEXT, SET_QRIS,
+    SET_QRIS_CAPTION, SET_SUCCESS_TEXT, SET_REJECT_TEXT,
+    SET_WATERMARK, SET_TESTI_CAPTION, SET_STATIC_LINK,
+    ADD_PKG_NAME, ADD_PKG_PRICE, ADD_PKG_DURATION, ADD_PKG_DESC, ADD_PKG_CHATID,
+    EDIT_PKG_PICK, EDIT_PKG_NAME, EDIT_PKG_PRICE, EDIT_PKG_DURATION, EDIT_PKG_CHATID,
+    BROADCAST_WAIT, BROADCAST_CONFIRM,
+    EXPORT_PANEL, EXPORT_SET_CHAT, EXPORT_SET_INTERVAL,
+    # Paket VIP Kolektif (mis. "Paket 16 Link") -- lihat pkgcol_* di bawah.
+    PKG_COLLECTIVE_PICK, PKG_COLLECTIVE_MENU, PKG_COLLECTIVE_ADD_WAIT,
+    # Alur beli paket + input kode promo opsional (buy_start dst di bawah).
+    PROMO_CHOICE, PROMO_INPUT_WAIT,
+    # Menu admin "🎟️ Kode Promo" di /settings (promo_menu_render dst).
+    PROMO_MENU, PROMO_SET_CHANNEL, PROMO_SET_POST_CHANNEL, PROMO_SET_DISCOUNT,
+    PROMO_SET_MAXUSES, PROMO_SET_ROTATE_DAYS, PROMO_SET_BROADCAST_HOUR,
+    PROMO_SET_POST_TEXT, PROMO_SET_BROADCAST_TEXT,
+) = range(37)
+
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in config.ADMIN_IDS
+
+
+def generate_unique_code(base_amount: int, tx_counter: int) -> tuple[int, str]:
+    """Buat nominal unik (contoh: 50000 -> 50123) berbasis `tx_id`, supaya
+    matching bukti transfer (nama+tanggal+nominal, lihat verify_proof_locally())
+    lebih presisi saat banyak user membayar nominal dasar yang sama secara
+    bersamaan. Kembalikan (nominal_final, kode_unik_3_digit). Murni lokal --
+    tidak memanggil pihak ketiga mana pun."""
+    unique_suffix = (tx_counter % 899) + 100  # angka 100-998
+    final_amount = base_amount + unique_suffix
+    return final_amount, str(unique_suffix)
+
+
+# ── Dukungan emoji premium/custom tanpa perlu admin mengetik ID manual ─────
+# Saat admin memakai emoji premium Telegram di dalam pesan (teks sapaan, teks
+# menu VIP, atau broadcast), Telegram sudah otomatis menyertakan info emoji itu
+# sebagai "entity" custom_emoji di pesan admin (lengkap dengan custom_emoji_id-nya)
+# — admin tidak perlu tahu atau ketik ID-nya sama sekali. python-telegram-bot
+# punya property bawaan `message.text_html` / `message.caption_html` yang
+# mengonversi teks + seluruh entity (bold, italic, dan emoji premium/custom)
+# jadi satu string HTML siap-kirim (format <tg-emoji emoji-id="...">🔥</tg-emoji>
+# untuk emoji premium). String HTML inilah yang kita simpan ke database, dan
+# nanti dikirim ulang ke user dengan parse_mode=HTML supaya emoji premiumnya
+# ikut tampil (catatan: pengguna yang menerima perlu Telegram Premium supaya
+# terlihat animasi/versi premiumnya; kalau tidak, tetap tampil emoji biasa).
+def html_of_text(message) -> str:
+    """Ambil versi HTML dari teks pesan (termasuk emoji premium), fallback ke
+    teks polos kalau text_html tidak tersedia."""
+    return getattr(message, "text_html", None) or message.text or ""
+
+
+def html_of_caption(message) -> str:
+    """Sama seperti html_of_text tapi untuk caption foto."""
+    return getattr(message, "caption_html", None) or message.caption or ""
+
+
+def render_template(template: str, **placeholders) -> str:
+    """Ganti placeholder seperti {package}/{amount}/{expiry}/{reason} pada
+    template pesan (qris_caption_text, payment_success_text, payment_reject_text,
+    dll) dengan nilai transaksi yang sebenarnya. Placeholder yang tidak dikenali
+    dibiarkan apa adanya (tidak menyebabkan error), sehingga admin bebas menulis
+    kurung kurawal biasa di teksnya tanpa membuat bot crash."""
+    text = template
+    for key, value in placeholders.items():
+        text = text.replace("{" + key + "}", str(value))
+    return text
+
+
+def rupiah(amount: int) -> str:
+    """Format angka rupiah dengan pemisah ribuan titik, mis. 50000 -> '50.000'."""
+    return f"{amount:,}".replace(",", ".")
+
+
+# ── Tampilan jumlah member VIP di menu utama (social proof) ────────────────
+# Angka ASLI member VIP aktif "digelembungkan" biar kelihatan lebih ramai --
+# pola umum dipakai bot jualan. Formula SUDAH DIKONFIRMASI oleh admin:
+#   1) jumlah ASLI dikalikan MULTIPLIER_VIP_DISPLAY (1000), mis. 1 member
+#      asli -> 1.000, 5 member asli -> 5.000.
+#   2) Selama hasil kali itu MASIH DI BAWAH 10.000, tampil apa adanya
+#      dengan pemisah ribuan titik ala Indonesia -- mis. 1 member asli
+#      -> "1.000", 9 member asli -> "9.000".
+#   3) begitu hasil kali itu SUDAH MENCAPAI 10.000, notasi berubah ke "K",
+#      TAPI (ini bagian yang beda dari notasi "K" pada umumnya, sengaja
+#      sesuai instruksi admin): 1 "K" di sini = 10.000, BUKAN 1.000. Jadi
+#      10 member asli (hasil kali 10.000) tampil "1K" -- BUKAN "10K" seperti
+#      notasi K standar. 25 member asli (hasil kali 25.000) -> "2.5K".
+# Dipasang sebagai placeholder {vip_count} di greeting_text / vip_menu_text
+# (lihat render_with_vip_count()) supaya admin bebas atur DI MANA angka ini
+# muncul lewat /settings, tanpa perlu ubah kode lagi.
+MULTIPLIER_VIP_DISPLAY = 1000
+_VIP_DISPLAY_K_UNIT = 10_000  # 1 "K" tampilan = 10.000 hasil kali (BUKAN 1.000)
+
+
+def get_active_vip_count() -> int:
+    """Jumlah member VIP yang MASIH AKTIF saat ini (expiry_date belum lewat).
+    Pakai sb.get_stats() yang sudah ada (bukan query baru) supaya konsisten
+    dengan angka yang sama dipakai di panel Statistik /settings."""
+    try:
+        return int(sb.get_stats().get("active_vip") or 0)
+    except Exception as e:
+        logger.warning(f"Gagal ambil jumlah VIP aktif untuk {{vip_count}}: {e}")
+        return 0
+
+
+def format_vip_count_display(real_count: int) -> str:
+    displayed = max(0, int(real_count)) * MULTIPLIER_VIP_DISPLAY
+    if displayed < _VIP_DISPLAY_K_UNIT:
+        return f"{displayed:,}".replace(",", ".")
+    val = displayed / _VIP_DISPLAY_K_UNIT
+    return f"{val:.1f}".rstrip("0").rstrip(".") + "K"
+
+
+def render_with_vip_count(template: str) -> str:
+    """Sisipkan placeholder {vip_count} (lihat format_vip_count_display) ke
+    template teks apa pun -- aman dipanggil walau template-nya tidak
+    memakai placeholder ini sama sekali (render_template membiarkan
+    placeholder yang tidak dikenal apa adanya, tidak ada yang error)."""
+    return render_template(template, vip_count=format_vip_count_display(get_active_vip_count()))
+
+
+# Username Telegram admin/kontak yang ditampilkan di pesan hasil approve/reject
+# (isi asli & default ada di config.py -> CONTACT_USERNAME).
+CONTACT_USERNAME = config.CONTACT_USERNAME
+
+
+def result_kb() -> InlineKeyboardMarkup:
+    """Keyboard yang disertakan pada pesan hasil pembayaran (approved/rejected):
+    tombol kembali ke menu utama bot + tombol kontak admin."""
+    return InlineKeyboardMarkup([
+        [make_button("🔙 Kembali ke Menu Utama", callback_data="back_main", style="danger")],
+        [make_button("💬 Hubungi Admin", url=f"https://t.me/{CONTACT_USERNAME}", style="primary")],
+    ])
+
+
+# ── Tombol "Kembali" untuk semua langkah di dalam /settings ────────────────
+
+def back_kb() -> InlineKeyboardMarkup:
+    """Keyboard sederhana berisi 1 tombol untuk batal & kembali ke menu settings."""
+    return InlineKeyboardMarkup([[make_button("🔙 Batal & Kembali ke Menu Settings", callback_data="settings_cancel", style="danger")]])
+
+
+def with_back(markup):
+    """Tambahkan baris tombol 'Kembali' di bawah keyboard yang sudah ada (mis. daftar paket)."""
+    rows = list(markup.inline_keyboard) if markup else []
+    rows.append([make_button("🔙 Kembali ke Menu Settings", callback_data="settings_cancel", style="danger")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ── Transisi antar menu: Ease-Out Cubic (bukan Lerp/linear lagi) ────────────
+# Telegram Bot API tidak punya animasi visual asli (bukan canvas/web UI), jadi
+# "gerakan" di sini disimulasikan lewat beberapa kali edit pesan berisi progress
+# bar yang mengisi mengikuti kurva Ease-Out Cubic: cepat di awal, melambat halus
+# menjelang akhir ("slow in, slow out" -- salah satu dari 12 prinsip animasi
+# Disney, juga dasar easing curve standar di iOS/Material Design). Ini jelas
+# lebih "berbobot" dibanding versi lama yang cuma satu jeda linear ("· · ·").
+#
+# Timeline dihitung pakai Animator (easing.py) yang berbasis delta-time NYATA
+# (time.monotonic()), bukan asumsi tiap frame delay-nya sama persis -- jadi
+# progress tetap presisi walau ada jeda jaringan saat memanggil Telegram API.
+#
+# Jumlah frame & total durasi SENGAJA dijaga tetap kecil (di bawah ini) supaya
+# tidak melanggar rate-limit edit pesan Telegram (flood control) -- kalau
+# Telegram sempat membalas RetryAfter, animasi langsung dihentikan dan pesan
+# akhir tetap ditampilkan seperti biasa (menu tidak pernah gagal tampil hanya
+# gara-gara animasinya kena limit).
+FADE_DURATION = 0.6     # detik, total durasi animasi reveal
+FADE_FRAME_TICK = 0.12  # detik, jarak antar sampling progress (~5 frame)
+FADE_BAR_WIDTH = 10
+
+
+async def fade_transition(query, text: str, **kwargs):
+    """Ganti isi pesan (lewat query.edit_message_text) dengan animasi reveal
+    berbasis Ease-Out Cubic (progress bar yang mengisi lalu melambat & settle),
+    baru menampilkan konten menu yang sebenarnya. `kwargs` diteruskan apa
+    adanya ke edit_message_text akhir (parse_mode, reply_markup, dst).
+
+    Kalau animasi gagal di tengah jalan (mis. pesan sumbernya foto/caption
+    yang tidak boleh diedit pakai edit_message_text, atau Telegram membalas
+    RetryAfter karena rate-limit), fungsi ini langsung lompat ke tahap akhir
+    tanpa mengganggu jalannya menu -- animasi hanya "hiasan", bukan sesuatu
+    yang boleh membuat menu gagal tampil."""
+    anim = Animator(duration=FADE_DURATION, easing=ease_out_cubic)
+    try:
+        while not anim.is_done():
+            bar = render_bar(anim.value(), width=FADE_BAR_WIDTH)
+            await query.edit_message_text(bar)
+            await asyncio.sleep(FADE_FRAME_TICK)
+    except RetryAfter:
+        pass  # kena flood-control -> langsung skip ke tahap akhir, jangan retry animasi
+    except Exception:
+        pass  # mis. BadRequest "message is not modified" / sumber pesan berupa foto
+    await query.edit_message_text(text, **kwargs)
+
+
+# ── Animasi "sedang memproses" saat verifikasi bukti transfer ──────────────
+# Beda dengan fade_transition (durasi tetap/diketahui), proses verifikasi di
+# sini (download foto -> hash -> OCR -> cross-check API DANA) durasinya TIDAK
+# diketahui pasti. Karena itu animasinya dibuat "looping" (progress bar mengisi
+# lalu reset dengan efek elastis di titik baliknya, Ease-Out Elastic) dan
+# dijalankan sebagai asyncio.Task TERPISAH yang benar-benar berjalan PARALEL
+# dengan kerja aslinya -- bukan animasi pura-pura yang jalan sendiri lepas dari
+# progres asli. Dihentikan dari luar (stop_processing_animation) begitu hasil
+# verifikasi sudah didapat.
+PROCESSING_ANIM_TICK = 0.4          # detik antar edit pesan selama animasi berjalan
+PROCESSING_ANIM_CYCLE = 1.2         # detik, durasi satu siklus isi -> reset progress bar
+PROCESSING_ANIM_MAX_DURATION = 25.0  # detik, jaring pengaman terakhir (lihat docstring di bawah)
+
+
+async def animate_processing(message, label: str):
+    """Jalankan animasi Ease-Out Elastic di `message` sampai di-cancel dari luar.
+
+    `PROCESSING_ANIM_MAX_DURATION` adalah jaring pengaman: kalau task ini lupa
+    di-cancel (mis. ada exception tak terduga di tengah proses verifikasi yang
+    membuat alur normal tidak sempat memanggil stop_processing_animation),
+    animasi akan berhenti sendiri setelah durasi maksimum itu -- supaya tidak
+    mengedit pesan yang sama tanpa henti dan menyedot rate-limit Telegram
+    selamanya."""
+    overall_start = time.monotonic()
+    cycle = 0
+    try:
+        while (time.monotonic() - overall_start) < PROCESSING_ANIM_MAX_DURATION:
+            anim = Animator(duration=PROCESSING_ANIM_CYCLE, easing=ease_out_elastic)
+            dots = "." * ((cycle % 3) + 1)
+            while not anim.is_done():
+                bar = render_bar(anim.value(), width=10)
+                await message.edit_text(f"{label}{dots}\n{bar}")
+                await asyncio.sleep(PROCESSING_ANIM_TICK)
+            cycle += 1
+    except asyncio.CancelledError:
+        raise
+    except RetryAfter:
+        return
+    except Exception:
+        return
+
+
+async def stop_processing_animation(task: "asyncio.Task | None"):
+    """Hentikan task animate_processing dengan aman. Dipanggil TEPAT SEBELUM
+    setiap edit_text hasil akhir verifikasi (approve/reject/pending/duplikat),
+    supaya animasi tidak terus mengedit pesan yang sudah berisi hasil final."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+async def settings_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dipanggil dari tombol 'Kembali' di tengah alur /settings (add/edit paket, dll)."""
+    query = update.callback_query
+    await query.answer()
+    for k in ("new_pkg", "edit_pkg_id", "edit_pkg_name", "edit_pkg_price", "edit_pkg_duration", "edit_pkg_chatid", "broadcast_payload"):
+        context.user_data.pop(k, None)
+    await fade_transition(
+        query, "⚙️✨ *Menu Pengaturan Bot*", parse_mode=ParseMode.MARKDOWN, reply_markup=settings_menu_kb()
+    )
+    return ConversationHandler.END
+
+
+# ── Emoji "premium" untuk mempercantik tampilan menu & broadcast ───────────
+#
+# Catatan jujur: Telegram punya "Custom Emoji" khusus Telegram Premium yang bisa
+# animasi, tapi (1) animasinya HANYA terlihat oleh penerima yang juga punya
+# Telegram Premium (user biasa cuma lihat versi statis), dan (2) butuh
+# custom_emoji_id spesifik dari paket emoji Premium tertentu — bukan emoji
+# unicode biasa. ID paket itu diisi admin di config.PREMIUM_EMOJI_IDS (lihat
+# komentar lengkap di config.py soal cara mendapatkannya). Kalau belum diisi
+# (masih None), karakter di bawah tetap dikirim sebagai emoji unicode biasa
+# (✨💎👑🔥⭐) yang tampil identik di SEMUA perangkat tanpa syarat Premium.
+
+EMOJI_IDS = getattr(config, "PREMIUM_EMOJI_IDS", {})  # {} kalau belum diisi admin
+
+# Emoji unicode "pemicu" -> nama key di config.PREMIUM_EMOJI_IDS. Dipakai oleh
+# apply_premium_emoji_html() (fitur 📢 Broadcast, lihat broadcast_receive()) --
+# kalau admin mengetik salah satu karakter ini di teks/caption broadcast, dan
+# ID-nya sudah diisi di config, karakter itu otomatis diganti jadi emoji
+# Premium custom saat dikirim.
+BROADCAST_TRIGGER_EMOJI = {"👑": "crown", "✨": "sparkle", "💎": "diamond", "🔥": "fire", "⭐": "star"}
+
+
+def premium_entities(text: str, emoji_map: dict):
+    """Bangun list MessageEntity CUSTOM_EMOJI untuk teks yang mengandung emoji
+    unicode di `emoji_map` (mis. {"👑": "crown"}), HANYA kalau ID-nya sudah
+    diisi di config.PREMIUM_EMOJI_IDS. Kalau belum diisi, kembalikan None
+    (fallback otomatis ke emoji unicode biasa, tetap tampil normal).
+
+    Catatan: dipertahankan sebagai helper serbaguna (pakai `entities=` di
+    Bot API, cocok untuk teks TANPA parse_mode). Untuk fitur Broadcast yang
+    memang sudah pakai parse_mode=HTML (supaya bold/italic dari admin tetap
+    jalan), dipakai apply_premium_emoji_html() di bawah -- bukan fungsi ini --
+    karena `entities=` dan `parse_mode=` tidak boleh dipakai bersamaan di
+    satu pemanggilan Bot API yang sama."""
+    from telegram import MessageEntity
+    if not EMOJI_IDS:
+        return None
+    entities = []
+    for ch, key in emoji_map.items():
+        custom_id = EMOJI_IDS.get(key)
+        if not custom_id:
+            continue
+        idx = text.find(ch)
+        while idx != -1:
+            entities.append(MessageEntity(
+                type=MessageEntity.CUSTOM_EMOJI, offset=idx, length=len(ch), custom_emoji_id=custom_id
+            ))
+            idx = text.find(ch, idx + 1)
+    return entities or None
+
+
+def apply_premium_emoji_html(html_text: str) -> str:
+    """Ganti setiap karakter emoji "pemicu" (BROADCAST_TRIGGER_EMOJI) di dalam
+    teks HTML broadcast (hasil html_of_text()/html_of_caption(), yang sudah
+    memakai parse_mode=HTML) dengan tag <tg-emoji emoji-id="..."> -- HANYA
+    untuk emoji yang ID-nya sudah diisi admin di config.PREMIUM_EMOJI_IDS.
+    Emoji yang ID-nya belum diisi dibiarkan sebagai unicode biasa (tetap
+    tampil normal, tidak ada yang rusak).
+
+    Catatan penting soal cara kerja emoji Premium custom di Telegram: emoji
+    ini akan ikut terkirim & TAMPIL untuk SEMUA penerima broadcast (baik yang
+    punya Telegram Premium maupun tidak) -- bedanya, hanya penerima yang
+    PUNYA Telegram Premium yang melihat versi animasinya; yang tidak punya
+    tetap melihat gambar emoji itu, hanya statis (tidak bergerak). Ini
+    perilaku bawaan Telegram, bukan sesuatu yang bisa diubah lewat bot.
+    """
+    if not EMOJI_IDS or not html_text:
+        return html_text
+    for ch, key in BROADCAST_TRIGGER_EMOJI.items():
+        custom_id = EMOJI_IDS.get(key)
+        if not custom_id or ch not in html_text:
+            continue
+        html_text = html_text.replace(ch, f'<tg-emoji emoji-id="{custom_id}">{ch}</tg-emoji>')
+    return html_text
+
+
+
+def settings_menu_kb() -> InlineKeyboardMarkup:
+    """Menu utama /settings + tombol 📊 Statistik & 📢 Broadcast, tanpa perlu
+    mengubah keyboards.py (menyisipkan baris tombol tambahan di atas baris
+    "❎ Tutup" milik menu dasar). Statistik & Broadcast sengaja digabung jadi
+    satu baris (sejajar 2 kolom) supaya konsisten dengan tombol-tombol lain di
+    menu ini yang juga berpasangan 2, bukan menumpuk 1 tombol per baris --
+    dan "Tutup" tetap dijaga jadi baris PALING BAWAH (bukan malah tertindih
+    di tengah oleh baris yang disisipkan)."""
+    base = kb.settings_menu_keyboard()
+    rows = list(base.inline_keyboard) if base else []
+
+    # Baris terakhir menu dasar adalah "❎ Tutup" -- pisahkan dulu supaya baris
+    # baru (Statistik + Broadcast) bisa disisipkan SEBELUM Tutup, bukan sesudahnya.
+    tutup_row = rows.pop() if rows else [make_button("❎ Tutup", callback_data="settings_close", style="danger")]
+
+    rows.append([
+        make_button("📊✨ Statistik Bot", callback_data="settings_stats", style="primary"),
+        make_button("📢💎 Broadcast Pesan", callback_data="settings_broadcast", style="primary"),
+    ])
+    rows.append([
+        make_button("📤 Export Data Otomatis", callback_data="settings_export", style="primary"),
+    ])
+    rows.append([
+        make_button("🔗📦 Kelola Paket Kolektif", callback_data="manage_collective", style="primary"),
+    ])
+    rows.append([
+        make_button("🎟️ Kode Promo", callback_data="settings_promo", style="primary"),
+    ])
+    rows.append(tutup_row)
+    return InlineKeyboardMarkup(rows)
+
+
+# ── Export Data Otomatis ke Log Chat ────────────────────────────────────────
+# Fitur ini SENGAJA terpisah dari config.LOG_CHAT_ID (yang statis, cuma bisa
+# diubah lewat edit config.py + restart bot): chat tujuan export, status
+# aktif/nonaktif, dan interval otomatisnya semua disimpan lewat
+# db.get_setting/set_setting supaya bisa diatur admin kapan saja langsung
+# dari menu /settings, tanpa perlu akses server/redeploy.
+#
+# Data yang diexport digabung dari sumber-sumber yang SUDAH ada di bot ini
+# (pengaturan teks/QRIS/dst via db.get_setting, statistik via
+# stats_broadcast.get_stats()). Kalau modul `database` ternyata juga
+# menyediakan fungsi dump mentah (mis. get_all_transactions/get_all_packages/
+# get_all_vip), _try_call() di bawah otomatis memakainya juga -- kalau
+# fungsi itu belum ada, bagian itu cukup dilewati (bukan error) supaya fitur
+# ini tidak bergantung pada isi database.py yang belum saya lihat.
+
+def _jsonify_rows(result):
+    """Pastikan hasil query siap di-JSON: kalau elemennya sqlite3.Row (bukan
+    dict biasa), konversi ke dict dulu.
+
+    SEBELUM INI hasil _try_call() langsung dipakai apa adanya -- kalau
+    fungsi database.py yang ditemukan ternyata mengembalikan list of
+    sqlite3.Row mentah (misal karena fallback ke fungsi lama seperti
+    list_packages() yang belum mengonversi ke dict), json.dumps(...,
+    default=str) di run_export() diam-diam mengubah tiap Row jadi string
+    alamat memori ("<sqlite3.Row object at 0x...>"), BUKAN error -- jadi
+    data hilang tanpa ada tanda kegagalan di log. Fungsi ini mencegah itu
+    dengan mengonversi eksplisit sebelum data sampai ke json.dumps()."""
+    if result is None:
+        return None
+    try:
+        return [dict(row) if not isinstance(row, dict) else row for row in result]
+    except TypeError:
+        # bukan list/iterable dict-able sama sekali -> jangan diteruskan
+        # sebagai data mentah yang bisa jatuh ke str(obj) di json.dumps
+        logger.warning("Export data: hasil query bukan list dict/Row yang bisa di-JSON, dilewati")
+        return None
+
+
+def _try_call(obj, names: list, *args, **kwargs):
+    """Panggil method pertama yang ADA di antara `names` pada `obj`. Kalau
+    tidak ada satupun (atau pemanggilannya error), kembalikan None secara
+    diam-diam -- dipakai supaya export tetap jalan meski sebagian fungsi
+    dump data belum tersedia di database.py. Hasilnya selalu sudah
+    di-normalisasi lewat _jsonify_rows() supaya tidak korup jadi string
+    alamat memori saat di-JSON-kan (lihat _jsonify_rows())."""
+    for name in names:
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            try:
+                return _jsonify_rows(fn(*args, **kwargs))
+            except Exception as e:
+                logger.warning(f"Export data: db.{name}() error, dilewati: {e}")
+                return None
+    return None
+
+
+def build_export_snapshot() -> dict:
+    """Kumpulkan semua data yang bisa diambil saat ini jadi satu dict siap-JSON."""
+    setting_defaults = {
+        "greeting_text":         getattr(db, "DEFAULT_GREETING", ""),
+        "greeting_photo_file_id": "",
+        "vip_menu_text":         getattr(db, "DEFAULT_VIP_INTRO", ""),
+        "how_to_order_text":     getattr(db, "DEFAULT_HOW_TO_ORDER", ""),
+        "qris_caption_text":     getattr(db, "DEFAULT_QRIS_CAPTION", ""),
+        "qris_static_string":    "",
+        "static_access_link":    "",
+        "payment_success_text":  getattr(db, "DEFAULT_PAYMENT_SUCCESS", ""),
+        "payment_reject_text":   getattr(db, "DEFAULT_PAYMENT_REJECT", ""),
+        "testi_caption_text":    getattr(db, "DEFAULT_TESTI_CAPTION", ""),
+    }
+    settings = {}
+    for key, default in setting_defaults.items():
+        try:
+            settings[key] = db.get_setting(key, default)
+        except Exception as e:
+            settings[key] = None
+            logger.warning(f"Export data: gagal ambil setting '{key}': {e}")
+
+    try:
+        stats = sb.get_stats()
+    except Exception as e:
+        stats = None
+        logger.warning(f"Export data: gagal ambil statistik: {e}")
+
+    try:
+        broadcast_target_count = len(sb.get_broadcast_user_ids())
+    except Exception:
+        broadcast_target_count = None
+
+    packages = _try_call(db, ["get_all_packages", "list_packages", "get_packages"])
+    transactions = _try_call(db, ["get_all_transactions", "list_transactions", "get_transactions"])
+    vip_members = _try_call(db, ["get_all_vip", "get_all_vip_members", "list_vip_members"])
+
+    return {
+        "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "settings": settings,
+        "stats": stats,
+        "broadcast_target_count": broadcast_target_count,
+        "packages": packages,
+        "transactions": transactions,
+        "vip_members": vip_members,
+    }
+
+
+def _export_target_chat_id() -> Optional[int]:
+    raw = db.get_setting("export_chat_id", "").strip()
+    if not raw:
+        raw = str(getattr(config, "LOG_CHAT_ID", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def run_export(context: ContextTypes.DEFAULT_TYPE, trigger: str = "manual"):
+    """Bangun snapshot data & kirim sebagai file JSON ke chat tujuan export.
+    Dipakai baik oleh trigger manual (/exportdata, tombol "Export Sekarang")
+    maupun job otomatis. Return (berhasil: bool, pesan_error: str | None)."""
+    chat_id = _export_target_chat_id()
+    if chat_id is None:
+        return False, "belum ada chat tujuan export yang diatur"
+
+    snapshot = build_export_snapshot()
+    try:
+        payload = json.dumps(snapshot, indent=2, ensure_ascii=False, default=str).encode("utf-8")
+    except Exception as e:
+        logger.error(f"Export data: gagal serialisasi snapshot: {e}")
+        return False, f"gagal menyusun data ({e})"
+
+    filename = f"export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    label = "Otomatis" if trigger == "otomatis" else "Manual"
+    n_pkg = len(snapshot["packages"]) if isinstance(snapshot.get("packages"), list) else "?"
+    n_tx  = len(snapshot["transactions"]) if isinstance(snapshot.get("transactions"), list) else "?"
+    n_vip = len(snapshot["vip_members"]) if isinstance(snapshot.get("vip_members"), list) else "?"
+    stats = snapshot.get("stats") or {}
+    # db_path & rentang tanggal transaksi -- diagnostik cepat kalau ada
+    # transaksi lama yang "hilang": kalau oldest_tx_created_at ternyata baru
+    # (bukan tanggal transaksi pertama kali bot dipakai), berarti database
+    # yang sedang dibaca BUKAN database lama itu (mis. ada bot.db lain yang
+    # ketinggalan dari sebelum Volume dipasang di Railway).
+    diag_line = ""
+    if stats.get("db_path"):
+        diag_line = (
+            f"\n🗄️ DB: <code>{stats['db_path']}</code>\n"
+            f"📅 Transaksi: {stats.get('oldest_tx_created_at') or '-'} s/d {stats.get('newest_tx_created_at') or '-'}"
+        )
+    caption = (
+        f"📦 <b>Export Data ({label})</b>\n"
+        f"🕒 {datetime.datetime.now().strftime('%d-%m-%Y %H:%M:%S')}\n"
+        f"🏷️ Paket: {n_pkg} | 💳 Transaksi: {n_tx} | 👑 VIP: {n_vip}"
+        f"{diag_line}"
+    )
+    try:
+        sent_msg = await context.bot.send_document(
+            chat_id,
+            document=io.BytesIO(payload),
+            filename=filename,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error(f"Export data: gagal kirim ke chat {chat_id}: {e}")
+        return False, str(e)
+
+    try:
+        db.set_setting("auto_export_last_at", datetime.datetime.now().isoformat(timespec="seconds"))
+        # Simpan jejak file backup PALING BARU (chat + message + file_id) supaya
+        # /restoredb bisa otomatis ambil backup terakhir dari grup log tanpa
+        # admin perlu cari & reply manual ke filenya satu-satu.
+        db.set_setting("last_export_chat_id", str(chat_id))
+        db.set_setting("last_export_message_id", str(sent_msg.message_id))
+        db.set_setting("last_export_file_id", sent_msg.document.file_id)
+    except Exception as e:
+        logger.warning(f"Export data: gagal mencatat waktu export terakhir: {e}")
+
+    return True, None
+
+
+def export_panel_render():
+    """Susun teks + keyboard panel 'Export Data Otomatis' (dipakai baik saat
+    tampil pertama kali maupun setelah toggle/simpan pengaturan)."""
+    enabled = db.get_setting("auto_export_enabled", "0") == "1"
+    chat_id_raw = db.get_setting("export_chat_id", "")
+    interval_hours = db.get_setting("auto_export_interval_hours", "24")
+    last_at = db.get_setting("auto_export_last_at", "")
+
+    status_line = "✅ Aktif" if enabled else "❌ Nonaktif"
+    chat_line = f"`{chat_id_raw}`" if chat_id_raw else "_belum diatur_"
+    last_line = last_at if last_at else "_belum pernah_"
+
+    text = (
+        "📤✨ *Export Data Otomatis*\n\n"
+        f"Status: {status_line}\n"
+        f"🎯 Chat tujuan: {chat_line}\n"
+        f"⏱ Interval: setiap *{interval_hours} jam*\n"
+        f"🕒 Export terakhir: {last_line}\n\n"
+        "Saat aktif, bot otomatis mengirim file JSON berisi pengaturan bot, "
+        "statistik ringkas, dan data paket/transaksi/VIP (bila tersedia) ke "
+        "chat tujuan di atas, sesuai interval yang diatur.\n\n"
+        "Gunakan tombol di bawah untuk mengatur:"
+    )
+    markup = InlineKeyboardMarkup([
+        [make_button(
+            "🔴 Nonaktifkan" if enabled else "🟢 Aktifkan",
+            callback_data="export_toggle", style=("danger" if enabled else "success"),
+        )],
+        [
+            make_button("🎯 Atur Chat Tujuan", callback_data="export_set_chat", style="primary"),
+            make_button("⏱ Atur Interval", callback_data="export_set_interval", style="primary"),
+        ],
+        [make_button("📤 Export Sekarang", callback_data="export_now", style="success")],
+        [make_button("🔙 Kembali ke Menu Settings", callback_data="settings_cancel", style="danger")],
+    ])
+    return text, markup
+
+
+async def export_panel_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler tombol-tombol di dalam panel Export Data Otomatis."""
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Khusus admin.", show_alert=True)
+        return ConversationHandler.END
+
+    data = query.data
+
+    if data == "export_toggle":
+        await query.answer()
+        enabled = db.get_setting("auto_export_enabled", "0") == "1"
+        db.set_setting("auto_export_enabled", "0" if enabled else "1")
+        text, markup = export_panel_render()
+        await fade_transition(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return EXPORT_PANEL
+
+    if data == "export_set_chat":
+        await query.answer()
+        await fade_transition(
+            query,
+            "🎯 Kirim *ID chat* tujuan export (angka, contoh `-1001234567890`), "
+            "ATAU forward salah satu pesan dari grup/channel log tujuan ke sini "
+            "supaya ID-nya otomatis terdeteksi.\n\n"
+            "💡 Bot harus sudah jadi member di chat tujuan itu.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb(),
+        )
+        return EXPORT_SET_CHAT
+
+    if data == "export_set_interval":
+        await query.answer()
+        await fade_transition(
+            query,
+            "⏱ Ketik interval export otomatis dalam *JAM* (angka bulat 1-720).\n"
+            "Contoh: `24` untuk sekali sehari, `168` untuk sekali seminggu.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb(),
+        )
+        return EXPORT_SET_INTERVAL
+
+    if data == "export_now":
+        await query.answer("📤 Mengirim export sekarang...")
+        ok, err = await run_export(context, trigger="manual")
+        text, markup = export_panel_render()
+        suffix = "\n\n✅ Export berhasil dikirim." if ok else f"\n\n❌ Export gagal: {err}"
+        await fade_transition(query, text + suffix, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return EXPORT_PANEL
+
+    await query.answer()
+    return EXPORT_PANEL
+
+
+async def export_save_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    target_chat_id = None
+
+    # Deteksi otomatis lewat pesan yang di-forward dari chat tujuan (kompatibel
+    # dengan forward_from_chat lama maupun forward_origin -- PTB 20.8+ mulai
+    # mengarahkan info forward lewat forward_origin).
+    forward_chat = getattr(msg, "forward_from_chat", None)
+    if forward_chat is None:
+        origin = getattr(msg, "forward_origin", None)
+        forward_chat = getattr(origin, "chat", None) if origin else None
+    if forward_chat is not None:
+        target_chat_id = forward_chat.id
+    elif msg.text:
+        try:
+            target_chat_id = int(msg.text.strip())
+        except ValueError:
+            target_chat_id = None
+
+    if target_chat_id is None:
+        await msg.reply_text(
+            "❌ Tidak bisa mengenali chat tujuan. Kirim ID chat berupa angka "
+            "(mis. `-1001234567890`), atau forward salah satu pesan dari grup/"
+            "channel tujuan ke sini.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_kb(),
+        )
+        return EXPORT_SET_CHAT
+
+    db.set_setting("export_chat_id", str(target_chat_id))
+
+    # Tes kirim sekarang juga supaya admin langsung tahu kalau bot belum jadi
+    # member/admin di chat tujuan, bukan baru ketahuan saat auto-export nanti.
+    warn = ""
+    try:
+        await context.bot.send_message(
+            target_chat_id,
+            "✅ Chat ini berhasil diatur sebagai tujuan *Export Data Otomatis*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        warn = (
+            f"\n\n⚠️ ID tersimpan, tapi bot GAGAL mengirim pesan tes ke chat "
+            f"itu ({e}). Pastikan bot sudah jadi member di sana sebelum "
+            f"export berikutnya berjalan."
+        )
+
+    text, markup = export_panel_render()
+    await msg.reply_text(
+        f"✅ Chat tujuan export diatur ke `{target_chat_id}`.{warn}\n\n" + text,
+        parse_mode=ParseMode.MARKDOWN, reply_markup=markup,
+    )
+    return EXPORT_PANEL
+
+
+async def export_save_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = (update.message.text or "").strip()
+    try:
+        hours = int(raw)
+    except ValueError:
+        hours = None
+
+    if hours is None or hours < 1 or hours > 720:
+        await update.message.reply_text(
+            "❌ Masukkan jumlah jam berupa angka bulat antara 1 - 720 (30 hari). "
+            "Contoh: `24` untuk sekali sehari.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_kb(),
+        )
+        return EXPORT_SET_INTERVAL
+
+    db.set_setting("auto_export_interval_hours", str(hours))
+    text, markup = export_panel_render()
+    await update.message.reply_text(
+        f"✅ Interval export otomatis diatur setiap *{hours} jam*.\n\n" + text,
+        parse_mode=ParseMode.MARKDOWN, reply_markup=markup,
+    )
+    return EXPORT_PANEL
+
+
+async def cmd_exportdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pintasan /exportdata -- trigger export manual langsung tanpa perlu buka
+    /settings dulu. Hasilnya tetap dikirim ke chat tujuan yang sudah diatur
+    (bukan ke chat tempat command ini diketik), supaya konsisten dengan hasil
+    export otomatis."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+    note = await update.message.reply_text("📤 Menyusun & mengirim export data...")
+    ok, err = await run_export(context, trigger="manual")
+    if ok:
+        await note.edit_text("✅ Export data berhasil dikirim ke chat tujuan yang sudah diatur.")
+    else:
+        await note.edit_text(
+            f"❌ Export data gagal: {err}\n\n"
+            "Atur/cek chat tujuan lewat /settings → 📤 Export Data Otomatis."
+        )
+
+
+async def job_auto_export_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Dijalankan berkala (lihat pendaftaran job_queue di main()). Fungsi ini
+    sendiri jalan tiap jam, tapi HANYA benar-benar mengirim export kalau:
+    (1) fitur auto-export sedang aktif, dan (2) waktu sejak export terakhir
+    sudah melewati interval yang diatur admin. Pendekatan "cek tiap jam" ini
+    dipilih supaya admin bisa mengubah interval kapan saja lewat menu tanpa
+    perlu me-restart/reschedule job secara manual."""
+    try:
+        enabled = db.get_setting("auto_export_enabled", "0") == "1"
+        if not enabled:
+            return
+        try:
+            interval_hours = int(db.get_setting("auto_export_interval_hours", "24") or "24")
+        except ValueError:
+            interval_hours = 24
+
+        last_str = db.get_setting("auto_export_last_at", "")
+        now = datetime.datetime.now()
+        if last_str:
+            try:
+                last_dt = datetime.datetime.fromisoformat(last_str)
+            except ValueError:
+                last_dt = None
+        else:
+            last_dt = None
+
+        if last_dt is not None and (now - last_dt) < datetime.timedelta(hours=interval_hours):
+            return  # belum waktunya
+
+        ok, err = await run_export(context, trigger="otomatis")
+        if not ok:
+            logger.warning(f"Auto export gagal: {err}")
+    except Exception as e:
+        logger.error(f"job_auto_export_tick error: {e}", exc_info=e)
+
+
+# ── Broadcast BERULANG (terjadwal, bukan sekali kirim) ──────────────────────
+# Beda dari /broadcast biasa (BROADCAST_WAIT/BROADCAST_CONFIRM di atas, kirim
+# SEKALI langsung ke semua user): fitur ini menyimpan SATU template pesan
+# yang lalu dikirim ULANG otomatis tiap interval tertentu, tanpa admin perlu
+# menekan kirim tiap kali. Sengaja REUSE alur compose /broadcast yang sudah
+# ada (broadcast_receive/broadcast_confirm) lewat flag context.user_data[
+# "broadcast_mode"]="recurring" -- supaya tidak ada dua cara berbeda untuk
+# menulis pesan (dengan/tanpa foto, emoji premium, dst), cukup satu alur
+# yang sama, cuma beda apa yang terjadi setelah dikonfirmasi.
+
+async def cmd_autobroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autobroadcast on|off|interval <jam>|setmessage|now|status."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return ConversationHandler.END
+
+    args = context.args
+    sub = args[0].lower() if args else "status"
+
+    if sub == "setmessage":
+        context.user_data["broadcast_mode"] = "recurring"
+        await update.message.reply_text(
+            "🔁 *Atur Pesan Broadcast Berulang*\n\n"
+            "Kirim pesan yang mau dijadikan template (boleh teks biasa, atau "
+            "foto + caption) -- pesan ini yang akan dikirim ULANG otomatis "
+            "tiap interval yang kamu atur, menggantikan template lama kalau "
+            "ada.\n\n"
+            "💎 Bold/italic dan emoji premium yang kamu pakai langsung di chat "
+            "ini akan ikut tampil ke user.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_kb(),
+        )
+        return BROADCAST_WAIT
+
+    if sub == "on":
+        if not db.get_setting("recurring_broadcast_payload", ""):
+            await update.message.reply_text(
+                "❌ Belum ada pesan berulang yang disimpan. Atur dulu lewat "
+                "`/autobroadcast setmessage`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ConversationHandler.END
+        db.set_setting("recurring_broadcast_enabled", "1")
+        await update.message.reply_text("✅ Broadcast berulang diaktifkan.")
+        return ConversationHandler.END
+
+    if sub == "off":
+        db.set_setting("recurring_broadcast_enabled", "0")
+        await update.message.reply_text("🔴 Broadcast berulang dinonaktifkan.")
+        return ConversationHandler.END
+
+    if sub == "interval":
+        try:
+            hours = float(args[1])
+            if not (0 < hours <= 720):
+                raise ValueError
+        except (IndexError, ValueError):
+            await update.message.reply_text(
+                "❌ Masukkan jumlah jam yang valid (0-720). Contoh: `/autobroadcast interval 12`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ConversationHandler.END
+        db.set_setting("recurring_broadcast_interval_hours", str(hours))
+        await update.message.reply_text(f"✅ Interval broadcast berulang diatur setiap {hours:g} jam.")
+        return ConversationHandler.END
+
+    if sub == "now":
+        raw = db.get_setting("recurring_broadcast_payload", "")
+        if not raw:
+            await update.message.reply_text(
+                "❌ Belum ada pesan berulang yang disimpan. Atur dulu lewat `/autobroadcast setmessage`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ConversationHandler.END
+        payload = json.loads(raw)
+        note = await update.message.reply_text("📤 Mengirim broadcast berulang sekarang...")
+        success, failed, total = await send_broadcast_payload(context, payload)
+        db.set_setting("recurring_broadcast_last_at", datetime.datetime.now().isoformat(timespec="seconds"))
+        await note.edit_text(f"✅ Terkirim: {success} berhasil, {failed} gagal, dari {total} target.")
+        return ConversationHandler.END
+
+    enabled = db.get_setting("recurring_broadcast_enabled", "0") == "1"
+    interval_hours = db.get_setting("recurring_broadcast_interval_hours", "24")
+    last_at = db.get_setting("recurring_broadcast_last_at", "belum pernah")
+    has_message = bool(db.get_setting("recurring_broadcast_payload", ""))
+    await update.message.reply_text(
+        "🔁 *Status Broadcast Berulang*\n\n"
+        f"Status: {'✅ Aktif' if enabled else '❌ Nonaktif'}\n"
+        f"📝 Pesan tersimpan: {'✅ Ada' if has_message else '❌ Belum ada'}\n"
+        f"⏱ Interval: setiap {interval_hours} jam\n"
+        f"🕒 Terakhir dikirim: {last_at}\n\n"
+        "Perintah:\n"
+        "`/autobroadcast setmessage` — atur/ganti pesan\n"
+        "`/autobroadcast on` / `off` — aktif/nonaktifkan\n"
+        "`/autobroadcast interval <jam>` — atur interval\n"
+        "`/autobroadcast now` — kirim sekarang (uji coba)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ConversationHandler.END
+
+
+async def job_auto_broadcast_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Sama pola-nya dengan job_auto_export_tick: dicek tiap jam, benar-benar
+    kirim hanya kalau sudah waktunya sesuai interval yang diatur admin."""
+    try:
+        if db.get_setting("recurring_broadcast_enabled", "0") != "1":
+            return
+        raw = db.get_setting("recurring_broadcast_payload", "")
+        if not raw:
+            return
+        try:
+            interval_hours = float(db.get_setting("recurring_broadcast_interval_hours", "24") or "24")
+        except ValueError:
+            interval_hours = 24
+
+        last_str = db.get_setting("recurring_broadcast_last_at", "")
+        now = datetime.datetime.now()
+        last_dt = None
+        if last_str:
+            try:
+                last_dt = datetime.datetime.fromisoformat(last_str)
+            except ValueError:
+                last_dt = None
+        if last_dt is not None and (now - last_dt) < datetime.timedelta(hours=interval_hours):
+            return  # belum waktunya
+
+        payload = json.loads(raw)
+        success, failed, total = await send_broadcast_payload(context, payload)
+        db.set_setting("recurring_broadcast_last_at", now.isoformat(timespec="seconds"))
+
+        report = (
+            f"📢🔁 *Broadcast berulang terkirim*\n\n"
+            f"Berhasil: *{success}* | Gagal: *{failed}* | Target: *{total}*"
+        )
+        if config.LOG_CHAT_ID:
+            try:
+                await context.bot.send_message(config.LOG_CHAT_ID, report, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                logger.warning(f"Gagal kirim laporan broadcast berulang ke LOG_CHAT_ID: {e}")
+    except Exception as e:
+        logger.error(f"job_auto_broadcast_tick error: {e}", exc_info=e)
+
+
+# ── Auto-post ULANG testimoni (recycle bukti transfer lama ke channel testi) ─
+# CATATAN PENTING: Bot API Telegram TIDAK punya cara untuk "membaca ulang"
+# riwayat pesan sebuah grup/channel secara acak (tidak ada method semacam
+# getChatHistory untuk bot) -- jadi fitur ini TIDAK benar-benar mengintip isi
+# grup log satu per satu. Sebagai gantinya (dan hasil akhirnya sama persis:
+# posting ulang bukti transfer LAMA secara acak ke channel testi), fitur ini
+# memilih ACAK dari transaksi yang statusnya APPROVED lewat
+# db.get_all_transactions() -- setiap bukti yang masuk ke grup log SELALU
+# berasal dari salah satu transaksi ini, jadi sumbernya setara, hanya lewat
+# jalur yang benar-benar bisa diakses bot (database, bukan histori chat).
+# Proses sensor+watermark+posting REUSE post_testimonial() yang sudah ada,
+# supaya hasilnya konsisten dengan posting testi normal (saat baru approve).
+
+async def cmd_autocollective(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autocollective -- buat (atau perbarui) 3 paket VIP kolektif sekaligus:
+    "Paket 16 Link", "Paket 17 Link", "Paket 18 Link". Channel-nya diambil
+    OTOMATIS dari target_chat_id semua paket VIP single yang masih aktif
+    (diurutkan sesuai list_packages(), yaitu harga ASC):
+        - Paket 16 Link -> channel ke-1 s.d. ke-16
+        - Paket 17 Link -> channel ke-1 s.d. ke-17
+        - Paket 18 Link -> channel ke-1 s.d. ke-18
+    Sengaja TUMPANG TINDIH antar paket (bukan dipecah rata) -- sesuai
+    keputusan admin: paket makin besar = makin banyak channel dari paket
+    yang sama, bukan channel yang berbeda-beda.
+
+    Paket VIP single sumbernya TIDAK diubah/dinonaktifkan sama sekali --
+    tetap bisa dibeli terpisah seperti biasa, cuma "dipinjam" channel-nya
+    saja ke paket kolektif ini.
+
+    Idempotent: kalau command ini dijalankan ulang (mis. ada paket single
+    baru ditambahkan lalu mau di-refresh), paket kolektif yang namanya
+    sudah ada TIDAK dibuat dobel -- daftar channel-nya cuma di-reset lalu
+    diisi ulang dari kondisi terbaru.
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    # Pool channel sumber: paket single AKTIF yang punya target_chat_id
+    # (paket kolektif lain yang mungkin sudah ada tidak ikut dihitung,
+    # supaya tidak "mendaur ulang" channel dari paket kolektif ke paket
+    # kolektif lain secara tidak sengaja).
+    pool = [
+        p for p in db.list_packages(active_only=True)
+        if (p["target_chat_id"] or "").strip()
+    ]
+
+    specs = [
+        ("Paket 16 Link", 150000, 16),
+        ("Paket 17 Link", 160000, 17),
+        ("Paket 18 Link", 400000, 18),
+    ]
+    max_needed = max(n for _, _, n in specs)
+
+    if not pool:
+        await update.message.reply_text(
+            "❌ Tidak ada paket VIP single (dengan Chat ID grup/channel) yang aktif "
+            "saat ini -- tidak ada channel yang bisa ditarik ke paket kolektif."
+        )
+        return
+
+    # Durasi paket kolektif = durasi yang PALING SERING dipakai di antara
+    # paket-paket single sumber (sesuai keputusan admin: "samakan saja").
+    duration_counts = {}
+    for p in pool:
+        duration_counts[p["duration_days"]] = duration_counts.get(p["duration_days"], 0) + 1
+    common_duration = max(duration_counts, key=duration_counts.get)
+
+    lines = [f"🪄 *Auto-buat Paket Kolektif*\n\nSumber channel: *{len(pool)}* paket VIP single aktif."]
+    if len(pool) < max_needed:
+        lines.append(
+            f"⚠️ Cuma ada {len(pool)} channel sumber (butuh sampai {max_needed} untuk "
+            f"Paket {max_needed} Link) -- paket yang kekurangan channel akan diisi "
+            f"SEMUA channel yang ada (kurang dari jumlah di namanya)."
+        )
+    lines.append(f"Durasi dipakai: *{common_duration} hari* (paling umum di antara paket sumber).\n")
+
+    for name, price, n_needed in specs:
+        # Cek apakah paket dengan nama ini sudah ada (idempotent -- jangan
+        # dobel kalau command dijalankan ulang).
+        existing = next(
+            (p for p in db.list_packages(active_only=False) if p["name"] == name), None
+        )
+        if existing:
+            pkg_id = existing["id"]
+            # PENTING: link & target_chat_id HARUS eksplisit dikosongkan (""),
+            # BUKAN None -- edit_package() menganggap None sebagai "biarkan
+            # nilai lama", jadi kalau paket ini sebelumnya pernah punya link
+            # statis / target_chat_id tunggal (mis. dari sebelum jadi paket
+            # kolektif), nilai lama itu akan tetap nyangkut di kolomnya.
+            # Paket kolektif WAJIB 100% mengandalkan tabel package_channels
+            # (setiap link dibuat baru & 1x-pakai saat dibeli) -- kalau kolom
+            # link/target_chat_id lama masih terisi, begitu package_channels
+            # kosong (mis. admin sempat hapus semua link sebelum re-run
+            # /autocollective), send_package_link() akan fallback diam-diam
+            # ke link lama itu, yang BUKAN link 1x-pakai.
+            db.edit_package(
+                pkg_id, name, price, common_duration,
+                description=existing["description"] or "",
+                link="", target_chat_id="",
+            )
+            db.clear_package_channels(pkg_id)
+            action = "diperbarui"
+        else:
+            db.add_package(name, price, common_duration, description="", link="", target_chat_id="")
+            pkg_id = next(p["id"] for p in db.list_packages(active_only=False) if p["name"] == name)
+            action = "dibuat"
+
+        chosen = pool[:n_needed]
+        for p in chosen:
+            db.add_package_channel(pkg_id, p["target_chat_id"], label=p["name"])
+
+        lines.append(f"✅ *{name}* {action} — Rp{price:,} — {len(chosen)} channel terpasang.".replace(",", "."))
+
+    lines.append(
+        "\nCek/atur lebih lanjut lewat /settings → 🔗📦 Kelola Paket Kolektif."
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_autotesti(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autotesti on|off|interval <jam>|now|status."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    args = context.args
+    sub = args[0].lower() if args else "status"
+
+    if sub == "on":
+        db.set_setting("auto_testi_enabled", "1")
+        await update.message.reply_text("✅ Auto-post ulang testimoni diaktifkan.")
+        return
+    if sub == "off":
+        db.set_setting("auto_testi_enabled", "0")
+        await update.message.reply_text("🔴 Auto-post ulang testimoni dinonaktifkan.")
+        return
+    if sub == "interval":
+        try:
+            hours = float(args[1])
+            if not (0 < hours <= 720):
+                raise ValueError
+        except (IndexError, ValueError):
+            await update.message.reply_text(
+                "❌ Masukkan jumlah jam yang valid (0-720). Contoh: `/autotesti interval 6`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        db.set_setting("auto_testi_interval_hours", str(hours))
+        await update.message.reply_text(f"✅ Interval auto-post testimoni diatur setiap {hours:g} jam.")
+        return
+    if sub == "now":
+        note = await update.message.reply_text("🎲 Mencari bukti transfer acak untuk diposting ulang...")
+        ok, info = await run_auto_testi_post(context)
+        await note.edit_text("✅ " + info if ok else "❌ " + info)
+        return
+
+    enabled = db.get_setting("auto_testi_enabled", "0") == "1"
+    interval_hours = db.get_setting("auto_testi_interval_hours", "6")
+    last_at = db.get_setting("auto_testi_last_at", "belum pernah")
+    await update.message.reply_text(
+        "🎲 *Status Auto-Post Testimoni*\n\n"
+        f"Status: {'✅ Aktif' if enabled else '❌ Nonaktif'}\n"
+        f"⏱ Interval: setiap {interval_hours} jam\n"
+        f"🕒 Terakhir posting: {last_at}\n\n"
+        "Bot memilih ACAK dari transaksi yang sudah *approved* & masih ada "
+        "file bukti transfernya, lalu posting ulang ke channel testi (lewat "
+        "proses sensor + watermark yang sama seperti posting normal).\n\n"
+        "Perintah:\n"
+        "`/autotesti on` / `off` — aktif/nonaktifkan\n"
+        "`/autotesti interval <jam>` — atur interval\n"
+        "`/autotesti now` — posting sekarang (uji coba)",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def run_auto_testi_post(context: ContextTypes.DEFAULT_TYPE):
+    """Pilih 1 transaksi approved secara acak (yang file bukti transfernya
+    masih ada di disk) & posting ulang ke channel testi lewat
+    post_testimonial(). Return (berhasil: bool, pesan: str)."""
+    if not config.TESTI_CHANNEL_ID:
+        return False, "TESTI_CHANNEL_ID belum diatur di config.py."
+
+    try:
+        all_tx = db.get_all_transactions()
+    except Exception as e:
+        logger.error(f"Auto-testi: gagal ambil daftar transaksi: {e}")
+        return False, f"gagal ambil daftar transaksi ({e})"
+
+    candidates = [
+        tx for tx in all_tx
+        if tx.get("status") == "approved" and os.path.exists(proof_image_path(tx["id"]))
+    ]
+    if not candidates:
+        return False, "tidak ada transaksi approved dengan file bukti transfer yang masih tersedia."
+
+    tx = random.choice(candidates)
+    pkg = db.get_package(tx["package_id"])
+    if not pkg:
+        return False, f"paket untuk TX #{tx['id']} tidak ditemukan (mungkin sudah dihapus)."
+
+    try:
+        await post_testimonial(context, tx, pkg)
+    except Exception as e:
+        logger.error(f"Auto-testi: gagal posting ulang TX #{tx['id']}: {e}")
+        return False, f"gagal posting TX #{tx['id']} ({e})"
+
+    db.set_setting("auto_testi_last_at", datetime.datetime.now().isoformat(timespec="seconds"))
+    return True, f"TX #{tx['id']} (paket {pkg['name']}) berhasil diposting ulang ke channel testi."
+
+
+async def job_auto_testi_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Pola sama seperti job auto-export/auto-broadcast: dicek tiap jam,
+    posting hanya kalau sudah waktunya."""
+    try:
+        if db.get_setting("auto_testi_enabled", "0") != "1":
+            return
+        try:
+            interval_hours = float(db.get_setting("auto_testi_interval_hours", "6") or "6")
+        except ValueError:
+            interval_hours = 6
+
+        last_str = db.get_setting("auto_testi_last_at", "")
+        now = datetime.datetime.now()
+        last_dt = None
+        if last_str:
+            try:
+                last_dt = datetime.datetime.fromisoformat(last_str)
+            except ValueError:
+                last_dt = None
+        if last_dt is not None and (now - last_dt) < datetime.timedelta(hours=interval_hours):
+            return  # belum waktunya
+
+        ok, info = await run_auto_testi_post(context)
+        if not ok:
+            logger.info(f"Auto-testi: dilewati/gagal ({info}).")
+    except Exception as e:
+        logger.error(f"job_auto_testi_tick error: {e}", exc_info=e)
+
+
+# ── 🎟️ Kode Promo (diskon paket VIP) ────────────────────────────────────────
+# Alur lengkap:
+# 1. Bot memposting/mengupdate SATU pesan di channel promo_post_channel (mis.
+#    @viphanseller) berisi ajakan klaim + tombol "🎁 Klaim Kode Promo". Kode
+#    promonya SENDIRI TIDAK PERNAH ditulis di teks postingan.
+# 2. Siapa pun (member channel atau bukan) boleh memencet tombol itu -- bot
+#    mengecek keanggotaan mereka di channel promo_required_channel (mis.
+#    @tahansel) lewat get_chat_member(). Kalau BELUM join, popup (alert)
+#    cuma menampilkan peringatan wajib join, kodenya tetap tidak muncul.
+#    Kalau SUDAH join, kodenya baru ditampilkan lewat popup -- sekaligus
+#    "mengambil" satu slot dari kuota promo_max_uses (default 15 orang).
+# 3. Kode yang sama itu lalu diketik user saat checkout (lihat buy_start /
+#    promo_code_receive di dekat start_purchase_flow) untuk memotong harga
+#    paket sebesar promo_discount_amount (default Rp5.000).
+# 4. Kode dirotasi OTOMATIS tiap promo_rotate_days hari (default 7 -- lihat
+#    job_promo_rotate_tick), atau kapan saja manual lewat /settings -> 🎟️
+#    Kode Promo -> "🔄 Generate & Post Kode Baru Sekarang". Rotasi otomatis
+#    membuat kuota 15 orang itu "reset" tiap minggu (lihat catatan di
+#    database.py::claim_promo_redemption -- kuota dihitung PER KODE).
+# 5. Broadcast pengingat ke semua user bot tiap malam jam 00:00 WIB (bisa
+#    diubah admin) lewat job_promo_broadcast_tick, kalau diaktifkan.
+# Semua pengaturan (channel wajib, channel posting, nominal diskon, kuota,
+# interval rotasi, jam broadcast, isi teks) diatur lewat /settings -> 🎟️
+# Kode Promo -- lihat promo_menu_render()/promo_admin_router() di bawah.
+
+def generate_promo_code() -> str:
+    """Kode promo acak, format PROMO-XXXXXX (6 karakter huruf besar+angka,
+    dipilih dari karakter yang gampang dibedakan -- tanpa 0/O/1/I supaya
+    tidak gampang salah baca/ketik user)."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "PROMO-" + "".join(random.choice(alphabet) for _ in range(6))
+
+
+def promo_status() -> dict:
+    """Ringkasan status promo saat ini, dipakai bareng oleh promo_post_render(),
+    promo_menu_render(), dan broadcast malam -- supaya semuanya konsisten."""
+    code = db.get_setting("promo_code", "")
+    try:
+        max_uses = int(db.get_setting("promo_max_uses", "15") or 15)
+    except ValueError:
+        max_uses = 15
+    try:
+        discount = int(db.get_setting("promo_discount_amount", "5000") or 5000)
+    except ValueError:
+        discount = 5000
+    claimed = db.count_promo_redemptions(code) if code else 0
+    return {
+        "enabled": db.get_setting("promo_enabled", "0") == "1",
+        "code": code,
+        "created_at": db.get_setting("promo_code_created_at", ""),
+        "required_channel": db.get_setting("promo_required_channel", "@tahansel"),
+        "post_channel": db.get_setting("promo_post_channel", "@viphanseller"),
+        "discount": discount,
+        "max_uses": max_uses,
+        "claimed": claimed,
+        "remaining": max(0, max_uses - claimed),
+        "rotate_days": db.get_setting("promo_rotate_days", "7"),
+        "broadcast_enabled": db.get_setting("promo_broadcast_enabled", "0") == "1",
+        "broadcast_hour": db.get_setting("promo_broadcast_hour_wib", "0"),
+    }
+
+
+def _promo_channel_url(channel: str) -> str:
+    channel = (channel or "").strip()
+    if channel.startswith("http://") or channel.startswith("https://"):
+        return channel
+    return f"https://t.me/{channel.lstrip('@')}"
+
+
+def promo_post_render():
+    """Teks + keyboard untuk postingan "Klaim Kode Promo" di channel promo
+    (promo_post_channel). Dipanggil ulang setiap update_promo_post() supaya
+    angka slot terklaim & kode yang berlaku di baliknya selalu sinkron."""
+    st = promo_status()
+    template = db.get_setting("promo_post_text", db.DEFAULT_PROMO_POST_TEXT)
+    text = render_template(
+        template,
+        discount=rupiah(st["discount"]),
+        channel=st["required_channel"],
+        max_uses=st["max_uses"],
+        claimed=st["claimed"],
+        remaining=st["remaining"],
+    )
+    markup = InlineKeyboardMarkup([
+        [make_button(f"🔗 Join {st['required_channel']}", url=_promo_channel_url(st["required_channel"]), style="primary")],
+        [make_button("🎁 Klaim Kode Promo", callback_data="promo_claim", style="success")],
+    ])
+    return text, markup
+
+
+async def update_promo_post(context: ContextTypes.DEFAULT_TYPE):
+    """Posting BARU (kalau belum pernah / gagal ditemukan lagi) atau EDIT
+    pesan yang sudah ada (self-healing kalau pesan lama sempat terhapus
+    admin channel) di promo_post_channel, supaya cuma ADA SATU postingan
+    promo yang selalu ter-update -- bukan spam postingan baru tiap rotasi/
+    tiap ada yang klaim."""
+    st = promo_status()
+    text, markup = promo_post_render()
+    chat_id = st["post_channel"]
+    msg_id = db.get_setting("promo_post_message_id", "")
+
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(
+                text, chat_id=chat_id, message_id=int(msg_id),
+                parse_mode=ParseMode.HTML, reply_markup=markup,
+            )
+            return True, "diupdate"
+        except Exception as e:
+            logger.info(f"Gagal edit postingan promo lama ({e}), posting ulang sebagai pesan baru.")
+
+    try:
+        sent = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        db.set_setting("promo_post_chat_id", str(chat_id))
+        db.set_setting("promo_post_message_id", str(sent.message_id))
+        return True, "diposting baru"
+    except Exception as e:
+        logger.error(f"Gagal memposting promo ke {chat_id}: {e}")
+        return False, str(e)
+
+
+async def rotate_promo_code(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Generate kode promo BARU (otomatis mingguan via job_promo_rotate_tick,
+    atau manual lewat /settings), simpan, lalu update postingan channel-nya."""
+    code = generate_promo_code()
+    db.set_setting("promo_code", code)
+    db.set_setting("promo_code_created_at", datetime.datetime.now().isoformat(timespec="seconds"))
+    await update_promo_post(context)
+    return code
+
+
+def apply_promo_code(code_input: str, telegram_user) -> tuple[int, str]:
+    """Validasi kode promo yang diketik user saat checkout paket. Return
+    (potongan_harga: int, pesan_untuk_user: str). potongan_harga = 0 kalau
+    kode tidak valid/promo nonaktif/kuota habis -- pembelian tetap lanjut
+    dengan harga normal, TIDAK pernah memblokir pembelian gara-gara promo."""
+    st = promo_status()
+    if not st["enabled"] or not st["code"]:
+        return 0, "ℹ️ Promo sedang tidak aktif saat ini, lanjut dengan harga normal."
+
+    code_input = (code_input or "").strip().upper()
+    if code_input != st["code"]:
+        return 0, "❌ Kode promo tidak valid/sudah kadaluarsa. Lanjut dengan harga normal."
+
+    result = db.claim_promo_redemption(
+        st["code"], telegram_user.id, telegram_user.username or telegram_user.first_name, st["max_uses"]
+    )
+    if result == "full":
+        return 0, (
+            f"❌ Kuota kode promo ini sudah penuh ({st['max_uses']} orang). "
+            "Lanjut dengan harga normal -- coba lagi setelah kode diperbarui."
+        )
+    return st["discount"], f"✅ Kode promo berhasil dipakai! Potongan Rp{rupiah(st['discount'])}."
+
+
+async def promo_claim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler tombol "🎁 Klaim Kode Promo" di postingan channel -- BUKAN
+    bagian dari /settings, siapa saja (bukan cuma admin) boleh memencetnya,
+    makanya didaftarkan sebagai CallbackQueryHandler global di main() (lihat
+    catatan di sana), bukan di dalam settings_conv."""
+    query = update.callback_query
+    st = promo_status()
+
+    if not st["enabled"] or not st["code"]:
+        await query.answer("Promo sedang tidak aktif saat ini.", show_alert=True)
+        return
+
+    user = query.from_user
+    try:
+        member = await context.bot.get_chat_member(st["required_channel"], user.id)
+        is_member = member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        logger.warning(f"Gagal cek keanggotaan {user.id} di {st['required_channel']}: {e}")
+        is_member = False
+
+    if not is_member:
+        await query.answer(
+            f"⚠️ Kamu wajib join channel {st['required_channel']} dulu sebelum bisa klaim kode promo ini!",
+            show_alert=True,
+        )
+        return
+
+    result = db.claim_promo_redemption(st["code"], user.id, user.username or user.first_name, st["max_uses"])
+    if result == "full":
+        await query.answer(
+            f"❌ Kode promo periode ini sudah mencapai batas maksimal ({st['max_uses']} orang). "
+            "Tunggu update kode berikutnya!",
+            show_alert=True,
+        )
+        return
+
+    await query.answer(
+        f"🎁 Kode Promo kamu: {st['code']}\n\n"
+        f"Potongan Rp{rupiah(st['discount'])} per paket VIP.\n"
+        "Masukkan kode ini saat checkout (pilih paket -> \"🎟️ Pakai Kode Promo\").",
+        show_alert=True,
+    )
+    # Update tampilan slot terklaim di postingan (best-effort -- kalau gagal,
+    # kode tetap valid & sudah terlanjur ditampilkan ke user barusan).
+    try:
+        await update_promo_post(context)
+    except Exception as e:
+        logger.warning(f"Gagal update tampilan slot postingan promo: {e}")
+
+
+async def job_promo_rotate_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Dicek tiap jam (pola sama seperti job auto-* lain): rotasi kode promo
+    otomatis begitu sudah promo_rotate_days hari sejak kode aktif dibuat --
+    atau LANGSUNG generate kalau promo diaktifkan tapi belum pernah punya
+    kode sama sekali."""
+    try:
+        if db.get_setting("promo_enabled", "0") != "1":
+            return
+        try:
+            rotate_days = float(db.get_setting("promo_rotate_days", "7") or 7)
+        except ValueError:
+            rotate_days = 7
+
+        code = db.get_setting("promo_code", "")
+        created_str = db.get_setting("promo_code_created_at", "")
+        need_rotate = not code
+        if code and created_str:
+            try:
+                created_dt = datetime.datetime.fromisoformat(created_str)
+                need_rotate = (datetime.datetime.now() - created_dt) >= datetime.timedelta(days=rotate_days)
+            except ValueError:
+                need_rotate = True
+
+        if need_rotate:
+            new_code = await rotate_promo_code(context)
+            logger.info(f"Kode promo dirotasi otomatis -> {new_code}")
+    except Exception as e:
+        logger.error(f"job_promo_rotate_tick error: {e}", exc_info=e)
+
+
+async def job_promo_broadcast_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Dicek tiap jam: kirim broadcast pengingat kode promo ke semua user bot
+    tepat sekali per hari, pas jam promo_broadcast_hour_wib (default 0 = jam
+    00:00 WIB). WIB = UTC+7, dihitung manual (bukan pakai library timezone
+    tambahan) karena bot ini sudah konsisten memakai datetime.now()/utcnow()
+    polos di semua fitur auto-* lain."""
+    try:
+        if db.get_setting("promo_broadcast_enabled", "0") != "1":
+            return
+        st = promo_status()
+        if not st["enabled"] or not st["code"]:
+            return
+
+        try:
+            target_hour = int(db.get_setting("promo_broadcast_hour_wib", "0") or 0) % 24
+        except ValueError:
+            target_hour = 0
+
+        now_wib = datetime.datetime.utcnow() + datetime.timedelta(hours=7)
+        if now_wib.hour != target_hour:
+            return
+
+        last_str = db.get_setting("promo_broadcast_last_at", "")
+        if last_str:
+            try:
+                last_wib = datetime.datetime.fromisoformat(last_str)
+                if last_wib.date() == now_wib.date():
+                    return  # sudah broadcast hari ini (WIB), jangan dobel
+            except ValueError:
+                pass
+
+        template = db.get_setting("promo_broadcast_text", db.DEFAULT_PROMO_BROADCAST_TEXT)
+        text = render_template(
+            template,
+            discount=rupiah(st["discount"]),
+            channel=st["required_channel"],
+            max_uses=st["max_uses"],
+            claimed=st["claimed"],
+            remaining=st["remaining"],
+        )
+        success, failed, total = await send_broadcast_payload(context, {"type": "text", "text": text})
+        db.set_setting("promo_broadcast_last_at", now_wib.isoformat(timespec="seconds"))
+        logger.info(f"Broadcast promo malam terkirim: {success} berhasil, {failed} gagal, dari {total} target.")
+    except Exception as e:
+        logger.error(f"job_promo_broadcast_tick error: {e}", exc_info=e)
+
+
+# ── 🎟️ Kode Promo -- menu admin (/settings -> 🎟️ Kode Promo) ───────────────
+
+def promo_menu_render():
+    """Teks status + keyboard pengaturan lengkap fitur kode promo, dipakai
+    setiap kali menu ini dibuka/di-refresh (settings_router & promo_admin_router)."""
+    st = promo_status()
+    created = st["created_at"] or "-"
+    text = (
+        "🎟️ <b>Kelola Kode Promo</b>\n\n"
+        f"Status: {'✅ Aktif' if st['enabled'] else '❌ Nonaktif'}\n"
+        f"Kode aktif: <code>{html.escape(st['code'] or '(belum ada)')}</code>\n"
+        f"Dibuat: {created}\n"
+        f"Klaim: <b>{st['claimed']}/{st['max_uses']}</b> (sisa {st['remaining']})\n"
+        f"Potongan: <b>Rp{rupiah(st['discount'])}</b> per paket\n"
+        f"Channel wajib join: {html.escape(st['required_channel'])}\n"
+        f"Channel posting promo: {html.escape(st['post_channel'])}\n"
+        f"Rotasi otomatis: setiap <b>{st['rotate_days']}</b> hari\n"
+        f"Broadcast malam: {'✅ Aktif' if st['broadcast_enabled'] else '❌ Nonaktif'} "
+        f"(jam {st['broadcast_hour']}:00 WIB)\n"
+    )
+    markup = InlineKeyboardMarkup([
+        [make_button(
+            ("🔴 Nonaktifkan Promo" if st["enabled"] else "🟢 Aktifkan Promo"),
+            callback_data="promo_toggle_enabled", style=("danger" if st["enabled"] else "success"),
+        )],
+        [make_button("🔄 Generate & Post Kode Baru Sekarang", callback_data="promo_regenerate", style="primary")],
+        [
+            make_button("📢 Channel Wajib Join", callback_data="promo_set_channel", style="primary"),
+            make_button("📝 Channel Posting", callback_data="promo_set_post_channel", style="primary"),
+        ],
+        [
+            make_button("💰 Nominal Diskon", callback_data="promo_set_discount", style="primary"),
+            make_button("👥 Kuota Klaim", callback_data="promo_set_maxuses", style="primary"),
+        ],
+        [make_button("🔁 Interval Rotasi (hari)", callback_data="promo_set_rotate", style="primary")],
+        [make_button(
+            ("🔴 Nonaktifkan Broadcast Malam" if st["broadcast_enabled"] else "🟢 Aktifkan Broadcast Malam"),
+            callback_data="promo_toggle_broadcast", style=("danger" if st["broadcast_enabled"] else "success"),
+        )],
+        [make_button("🕛 Jam Broadcast (WIB)", callback_data="promo_set_broadcast_hour", style="primary")],
+        [
+            make_button("✏️ Teks Postingan Channel", callback_data="promo_set_post_text", style="primary"),
+            make_button("✏️ Teks Broadcast", callback_data="promo_set_broadcast_text", style="primary"),
+        ],
+        [make_button("⬅️ Kembali", callback_data="settings_cancel", style="danger")],
+    ])
+    return text, markup
+
+
+# Peta tombol "Atur X" -> (key setting, state PTB, teks prompt) yang dipakai
+# promo_admin_router() untuk pindah ke state input teks yang sesuai, dan oleh
+# promo_set_field_receive() untuk tahu setting mana yang sedang diisi & state
+# mana yang harus di-return ulang kalau validasinya gagal (supaya admin tidak
+# terlempar keluar dari menu promo cuma gara-gara salah ketik).
+PROMO_FIELD_MAP = {
+    "promo_set_channel": (
+        "promo_required_channel", "PROMO_SET_CHANNEL",
+        "📢 Kirim username channel yang WAJIB di-join dulu sebelum kode promo bisa "
+        "diklaim (mis. <code>@tahansel</code>):",
+    ),
+    "promo_set_post_channel": (
+        "promo_post_channel", "PROMO_SET_POST_CHANNEL",
+        "📝 Kirim username channel tempat postingan \"Klaim Kode Promo\" "
+        "diposting/diupdate (mis. <code>@viphanseller</code>):",
+    ),
+    "promo_set_discount": (
+        "promo_discount_amount", "PROMO_SET_DISCOUNT",
+        "💰 Kirim nominal potongan harga per paket (angka saja, tanpa titik, mis. <code>5000</code>):",
+    ),
+    "promo_set_maxuses": (
+        "promo_max_uses", "PROMO_SET_MAXUSES",
+        "👥 Kirim kuota jumlah orang yang boleh klaim kode promo ini (angka saja, mis. <code>15</code>):",
+    ),
+    "promo_set_rotate": (
+        "promo_rotate_days", "PROMO_SET_ROTATE_DAYS",
+        "🔁 Kirim interval rotasi kode dalam HARI (boleh desimal, mis. <code>7</code> untuk seminggu sekali):",
+    ),
+    "promo_set_broadcast_hour": (
+        "promo_broadcast_hour_wib", "PROMO_SET_BROADCAST_HOUR",
+        "🕛 Kirim jam broadcast malam dalam WIB, 0-23 (mis. <code>0</code> untuk jam 00:00 WIB):",
+    ),
+    "promo_set_post_text": (
+        "promo_post_text", "PROMO_SET_POST_TEXT",
+        "✏️ Kirim teks baru untuk postingan channel promo. Placeholder yang bisa dipakai: "
+        "<code>{discount} {channel} {max_uses} {claimed} {remaining}</code>",
+    ),
+    "promo_set_broadcast_text": (
+        "promo_broadcast_text", "PROMO_SET_BROADCAST_TEXT",
+        "✏️ Kirim teks baru untuk broadcast malam. Placeholder yang bisa dipakai: "
+        "<code>{discount} {channel} {max_uses} {claimed} {remaining}</code>",
+    ),
+}
+
+
+async def promo_admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler semua tombol di menu admin 🎟️ Kode Promo (PROMO_MENU state)."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Khusus admin.", show_alert=True)
+        return ConversationHandler.END
+
+    data = query.data
+
+    if data == "promo_toggle_enabled":
+        cur = db.get_setting("promo_enabled", "0") == "1"
+        db.set_setting("promo_enabled", "0" if cur else "1")
+        # Baru diaktifkan & belum pernah punya kode sama sekali -> langsung
+        # generate + posting supaya fiturnya langsung jalan tanpa admin perlu
+        # pencet "Generate" terpisah lagi.
+        if not cur and not db.get_setting("promo_code", ""):
+            await rotate_promo_code(context)
+        text, markup = promo_menu_render()
+        await fade_transition(query, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return PROMO_MENU
+
+    if data == "promo_toggle_broadcast":
+        cur = db.get_setting("promo_broadcast_enabled", "0") == "1"
+        db.set_setting("promo_broadcast_enabled", "0" if cur else "1")
+        text, markup = promo_menu_render()
+        await fade_transition(query, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return PROMO_MENU
+
+    if data == "promo_regenerate":
+        await fade_transition(query, "🔄 Membuat kode promo baru & memposting ke channel...")
+        new_code = await rotate_promo_code(context)
+        text, markup = promo_menu_render()
+        await context.bot.send_message(
+            query.message.chat_id,
+            f"✅ Kode baru berhasil dibuat & diposting: <code>{html.escape(new_code)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        await context.bot.send_message(query.message.chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return PROMO_MENU
+
+    if data in PROMO_FIELD_MAP:
+        key, state_name, prompt = PROMO_FIELD_MAP[data]
+        context.user_data["promo_edit_field"] = key
+        context.user_data["promo_edit_state_name"] = state_name
+        await fade_transition(query, prompt, parse_mode=ParseMode.HTML, reply_markup=back_kb())
+        return globals()[state_name]
+
+    text, markup = promo_menu_render()
+    await fade_transition(query, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    return PROMO_MENU
+
+
+async def promo_set_field_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Satu handler dipakai bareng untuk SEMUA sub-state PROMO_SET_* -- field
+    mana yang sedang diisi diketahui lewat context.user_data['promo_edit_field']
+    (diset oleh promo_admin_router() sebelum masuk ke state ini)."""
+    field = context.user_data.get("promo_edit_field")
+    state_name = context.user_data.get("promo_edit_state_name")
+    retry_state = globals().get(state_name, PROMO_MENU) if state_name else PROMO_MENU
+    text = (update.message.text or "").strip()
+
+    if not field:
+        await update.message.reply_text("Sesi kadaluwarsa, silakan buka menu lagi.", reply_markup=settings_menu_kb())
+        return ConversationHandler.END
+
+    if field in ("promo_required_channel", "promo_post_channel"):
+        if not text:
+            await update.message.reply_text("Tidak boleh kosong. Coba lagi:", reply_markup=back_kb())
+            return retry_state
+        value = text if text.startswith("http") else ("@" + text.lstrip("@"))
+        db.set_setting(field, value)
+
+    elif field in ("promo_discount_amount", "promo_max_uses"):
+        if not text.isdigit() or int(text) <= 0:
+            await update.message.reply_text(
+                "❌ Masukkan angka yang valid (lebih dari 0). Coba lagi:", reply_markup=back_kb()
+            )
+            return retry_state
+        db.set_setting(field, text)
+
+    elif field == "promo_rotate_days":
+        try:
+            days = float(text)
+            if days <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Masukkan jumlah hari yang valid (lebih dari 0). Coba lagi:", reply_markup=back_kb()
+            )
+            return retry_state
+        db.set_setting(field, str(days))
+
+    elif field == "promo_broadcast_hour_wib":
+        if not text.isdigit() or not (0 <= int(text) <= 23):
+            await update.message.reply_text("❌ Masukkan jam 0-23. Coba lagi:", reply_markup=back_kb())
+            return retry_state
+        db.set_setting(field, text)
+
+    elif field in ("promo_post_text", "promo_broadcast_text"):
+        db.set_setting(field, html_of_text(update.message))
+
+    context.user_data.pop("promo_edit_field", None)
+    context.user_data.pop("promo_edit_state_name", None)
+
+    # Perubahan teks/channel/nominal langsung diterapkan ke postingan channel
+    # yang sudah ada (kalau ada) supaya admin tidak perlu pencet "Generate"
+    # terpisah cuma untuk melihat efek perubahan pengaturannya.
+    if db.get_setting("promo_code", ""):
+        try:
+            await update_promo_post(context)
+        except Exception as e:
+            logger.warning(f"Gagal update postingan promo setelah ganti pengaturan: {e}")
+
+    menu_text, markup = promo_menu_render()
+    await update.message.reply_text(
+        "✅ Pengaturan disimpan.\n\n" + menu_text, parse_mode=ParseMode.HTML, reply_markup=markup
+    )
+    return PROMO_MENU
+
+
+# ── /restoredb -- pulihkan data dari backup export ──────────────────────────
+# Pasangan dari /exportdata: kalau /exportdata mengirim backup KELUAR ke grup
+# log, /restoredb menariknya balik MASUK ke bot. Dua cara pakai:
+#   1. Otomatis (tanpa reply apa pun) -- ambil backup PALING BARU yang sudah
+#      pernah dikirim run_export() ke grup log (dilacak lewat
+#      last_export_file_id, disimpan setiap kali export berhasil).
+#   2. Manual -- reply ke pesan berisi file .json export (mis. backup lama
+#      lain di grup log) lalu ketik /restoredb, untuk restore ke titik waktu
+#      tertentu, bukan cuma yang paling baru.
+# Restore SELALU minta konfirmasi dulu (lihat restoredb_confirm_cb) karena
+# aksi ini menimpa pengaturan bot yang sedang berjalan.
+
+async def _download_json_document(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> dict:
+    tg_file = await context.bot.get_file(file_id)
+    raw = await tg_file.download_as_bytearray()
+    return json.loads(bytes(raw).decode("utf-8"))
+
+
+def _restoredb_summary_text(snapshot: dict) -> str:
+    exported_at = snapshot.get("exported_at", "tidak diketahui")
+    n_settings = len(snapshot.get("settings") or {})
+    packages = snapshot.get("packages")
+    transactions = snapshot.get("transactions")
+    vip_members = snapshot.get("vip_members")
+    n_pkg = len(packages) if isinstance(packages, list) else "-"
+    n_tx = len(transactions) if isinstance(transactions, list) else "-"
+    n_vip = len(vip_members) if isinstance(vip_members, list) else "-"
+    return (
+        "♻️⚠️ *Konfirmasi Restore Data*\n\n"
+        f"🕒 Backup dari: *{exported_at}*\n"
+        f"⚙️ Pengaturan bot: *{n_settings}* item\n"
+        f"🏷️ Paket: *{n_pkg}* | 💳 Transaksi: *{n_tx}* | 👑 VIP: *{n_vip}*\n\n"
+        "⚠️ Ini akan MENIMPA pengaturan bot yang sedang berjalan dengan isi "
+        "backup ini. Paket/transaksi/VIP hanya ikut dipulihkan kalau "
+        "database.py punya fungsi importer yang cocok (kalau tidak ada, "
+        "bagian itu dilewati dan dilaporkan, bukan dianggap gagal total).\n\n"
+        "Lanjutkan?"
+    )
+
+
+async def cmd_restoredb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return
+
+    msg = update.message
+    file_id = None
+    source_desc = ""
+
+    # 1) Reply/lampiran manual -- override eksplisit ke file tertentu
+    doc = None
+    if msg.reply_to_message and msg.reply_to_message.document:
+        doc = msg.reply_to_message.document
+    elif msg.document:
+        doc = msg.document
+    if doc is not None:
+        if not doc.file_name.lower().endswith(".json"):
+            await msg.reply_text("❌ File itu bukan file `.json` hasil export.", parse_mode=ParseMode.MARKDOWN)
+            return
+        file_id = doc.file_id
+        source_desc = f"file `{doc.file_name}` yang kamu reply"
+
+    # 2) Tanpa reply -- otomatis pakai backup paling baru dari grup log
+    if file_id is None:
+        file_id = db.get_setting("last_export_file_id", "")
+        source_desc = "backup *paling baru* dari grup log (auto-export)"
+        if not file_id:
+            await msg.reply_text(
+                "❌ Belum ada backup yang tercatat. Jalankan `/exportdata` dulu "
+                "minimal sekali, atau reply ke file `.json` export yang mau "
+                "dipulihkan lalu ketik `/restoredb`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+    note = await msg.reply_text("📥 Mengunduh & membaca file backup...")
+    try:
+        snapshot = await _download_json_document(context, file_id)
+    except Exception as e:
+        await note.edit_text(f"❌ Gagal membaca file backup: {e}")
+        return
+
+    if not isinstance(snapshot, dict) or "settings" not in snapshot:
+        await note.edit_text(
+            "❌ File ini bukan hasil export dari bot ini (struktur JSON tidak dikenali)."
+        )
+        return
+
+    context.user_data["restoredb_snapshot"] = snapshot
+    summary = _restoredb_summary_text(snapshot)
+    markup = InlineKeyboardMarkup([
+        [make_button("✅ Ya, pulihkan", callback_data="restoredb_confirm", style="danger")],
+        [make_button("🔙 Batal", callback_data="restoredb_cancel", style="primary")],
+    ])
+    await note.edit_text(
+        f"Sumber: {source_desc}\n\n" + summary, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+    )
+
+
+async def restoredb_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Khusus admin.", show_alert=True)
+        return
+
+    if query.data == "restoredb_cancel":
+        context.user_data.pop("restoredb_snapshot", None)
+        await query.edit_message_text("Restore dibatalkan, tidak ada data yang diubah.")
+        return
+
+    snapshot = context.user_data.pop("restoredb_snapshot", None)
+    if not snapshot:
+        await query.edit_message_text("❌ Sesi restore kedaluwarsa, jalankan /restoredb lagi.")
+        return
+
+    await query.edit_message_text("♻️ Memulihkan data, mohon tunggu...")
+
+    # 1) Pengaturan bot -- ini SELALU bisa dipulihkan karena cuma lewat
+    #    db.get_setting/set_setting yang sudah pasti ada di database.py.
+    restored_settings, failed_settings = 0, 0
+    for key, value in (snapshot.get("settings") or {}).items():
+        try:
+            db.set_setting(key, value)
+            restored_settings += 1
+        except Exception as e:
+            failed_settings += 1
+            logger.warning(f"Restore data: gagal set setting '{key}': {e}")
+
+    # 2) Paket/transaksi/VIP -- best-effort lewat nama fungsi importer yang
+    #    umum dipakai. Kalau database.py belum punya salah satunya, bagian
+    #    itu dilewati (dilaporkan sebagai "dilewati", bukan error) supaya
+    #    restore tidak bergantung pada isi database.py yang tidak saya lihat.
+    results = {}
+    restore_map = {
+        "packages":     (["restore_packages", "import_packages", "bulk_set_packages", "set_all_packages"], snapshot.get("packages")),
+        "transactions": (["restore_transactions", "import_transactions", "bulk_set_transactions"], snapshot.get("transactions")),
+        "vip_members":  (["restore_vip", "restore_vip_members", "import_vip_members", "bulk_set_vip"], snapshot.get("vip_members")),
+    }
+    for label, (fn_names, data) in restore_map.items():
+        if not data:
+            results[label] = "kosong di backup"
+            continue
+        applied = False
+        for fn_name in fn_names:
+            fn = getattr(db, fn_name, None)
+            if callable(fn):
+                try:
+                    fn(data)
+                    results[label] = f"dipulihkan lewat db.{_escape_md(fn_name)}()"
+                    applied = True
+                except Exception as e:
+                    results[label] = f"error saat db.{_escape_md(fn_name)}(): {_escape_md(e)}"
+                    applied = True
+                break
+        if not applied:
+            results[label] = "dilewati (belum ada fungsi importer di database.py)"
+
+    report = (
+        "♻️✅ *Restore selesai*\n\n"
+        f"⚙️ Pengaturan: *{restored_settings}* dipulihkan"
+        + (f", *{failed_settings}* gagal" if failed_settings else "")
+        + "\n"
+        f"🏷️ Paket: {results['packages']}\n"
+        f"💳 Transaksi: {results['transactions']}\n"
+        f"👑 VIP: {results['vip_members']}"
+    )
+    await context.bot.send_message(query.from_user.id, report, parse_mode=ParseMode.MARKDOWN)
+
+    log_chat_id = _export_target_chat_id()
+    if log_chat_id:
+        try:
+            await context.bot.send_message(
+                log_chat_id,
+                f"♻️ Data dipulihkan oleh admin (`{query.from_user.id}`).\n\n{report}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            logger.warning(f"Restore data: gagal kirim log ke chat {log_chat_id}: {e}")
+
+
+# ── /start & menu utama ─────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    greeting = render_with_vip_count(db.get_setting("greeting_text", db.DEFAULT_GREETING))
+    photo_file_id = db.get_setting("greeting_photo_file_id", "")
+
+    if photo_file_id:
+        try:
+            await update.message.reply_photo(
+                photo=photo_file_id, caption=greeting, parse_mode=ParseMode.HTML,
+                reply_markup=kb.main_menu_keyboard(),
+            )
+        except Exception as exc:
+            # file_id kadaluarsa/tidak valid lagi (jarang terjadi, tapi bisa
+            # kalau bot di-blok lalu di-unblock, dsb) -> jangan sampai /start
+            # gagal total, fallback ke teks biasa tanpa foto.
+            logger.warning("Gagal kirim foto sapaan (file_id=%s), fallback ke teks: %s", photo_file_id, exc)
+            await update.message.reply_text(
+                greeting, parse_mode=ParseMode.HTML, reply_markup=kb.main_menu_keyboard()
+            )
+    else:
+        await update.message.reply_text(
+            greeting, parse_mode=ParseMode.HTML, reply_markup=kb.main_menu_keyboard()
+        )
+
+    # Tombol Mini App "Lihat Paket VIP" HARUS dikirim lewat reply keyboard
+    # (bukan inline) supaya Telegram.WebApp.sendData() di halamannya benar-
+    # benar sampai ke handle_webapp_data() -- lihat catatan di
+    # keyboards.py::main_menu_keyboard(). Reply keyboard tidak bisa dipasang
+    # bareng di pesan yang sama dengan inline keyboard di atas, jadi dikirim
+    # sebagai pesan kecil terpisah. Sekali terkirim, tombol ini akan tetap
+    # "menempel" di bawah kolom chat user (persistent) sampai dihapus lewat
+    # ReplyKeyboardRemove -- jadi tidak perlu dikirim ulang tiap menu dibuka.
+    webapp_kb = kb.webapp_launch_keyboard()
+    if webapp_kb:
+        await update.message.reply_text(
+            "Atau tekan tombol di bawah ini untuk melihat katalog VIP dalam tampilan tabel (Mini App):",
+            reply_markup=webapp_kb,
+        )
+
+
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "show_vip":
+        vip_text = render_with_vip_count(db.get_setting("vip_menu_text", db.DEFAULT_VIP_INTRO))
+
+        # Coba dulu versi Rich HTML (Bot API 10.1 sendRichMessage, tabel
+        # <table> asli, bukan <pre> box-drawing) -- lihat catatan lengkap di
+        # keyboards.py::format_vip_table_rich() & rich_api.py. Kalau gagal
+        # (server Bot API belum rollout method ini, error jaringan, dll),
+        # otomatis fallback ke tabel teks lama (format_vip_table()) supaya
+        # bot tetap jalan normal.
+        try:
+            table_html = kb.format_vip_table_rich()
+            await rich_api.send_rich_message(
+                query.message.chat_id,
+                f"<p>{vip_text}</p>{table_html}",
+                reply_markup=kb.vip_list_keyboard(),
+            )
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            return
+        except Exception as e:
+            logger.warning(f"sendRichMessage untuk show_vip gagal, fallback ke tabel teks biasa: {e}")
+
+        table = kb.format_vip_table()
+        text = f"{vip_text}\n\n{table}"
+        try:
+            await fade_transition(
+                query, text, parse_mode=ParseMode.HTML, reply_markup=kb.vip_list_keyboard(),
+            )
+        except Exception:
+            # Tombol "show_vip" ini bisa dipencet dari tampilan scan QRIS, yang
+            # pesannya berupa FOTO (edit_message_text tidak berlaku untuk pesan
+            # foto/caption) -> fallback: hapus pesan lama, kirim pesan baru.
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                query.message.chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb.vip_list_keyboard(),
+            )
+
+    elif query.data == "back_main":
+        greeting = render_with_vip_count(db.get_setting("greeting_text", db.DEFAULT_GREETING))
+        photo_file_id = db.get_setting("greeting_photo_file_id", "")
+        if photo_file_id:
+            # Pesan sapaan sekarang berupa FOTO -> edit_message_text (dipakai
+            # fade_transition) tidak berlaku sama sekali kalau pesan sumbernya
+            # teks biasa, dan juga tidak bisa mengubah pesan teks jadi foto.
+            # Jadi langsung hapus pesan lama & kirim ulang sebagai foto,
+            # konsisten dengan pola fallback show_vip di atas.
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            try:
+                await context.bot.send_photo(
+                    query.message.chat_id, photo=photo_file_id, caption=greeting,
+                    parse_mode=ParseMode.HTML, reply_markup=kb.main_menu_keyboard(),
+                )
+            except Exception as exc:
+                logger.warning("Gagal kirim foto sapaan (file_id=%s) di back_main, fallback ke teks: %s", photo_file_id, exc)
+                await context.bot.send_message(
+                    query.message.chat_id, greeting, parse_mode=ParseMode.HTML,
+                    reply_markup=kb.main_menu_keyboard(),
+                )
+        else:
+            try:
+                await fade_transition(
+                    query, greeting, parse_mode=ParseMode.HTML, reply_markup=kb.main_menu_keyboard()
+                )
+            except Exception:
+                # Pesan sumbernya foto (mis. layar scan QRIS) -> edit_message_text
+                # tidak berlaku, fallback hapus + kirim pesan teks baru.
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+                await context.bot.send_message(
+                    query.message.chat_id, greeting, parse_mode=ParseMode.HTML,
+                    reply_markup=kb.main_menu_keyboard(),
+                )
+
+    elif query.data == "how_to_order":
+        text = db.get_setting("how_to_order_text", db.DEFAULT_HOW_TO_ORDER)
+        try:
+            await fade_transition(
+                query, text, parse_mode=ParseMode.HTML, reply_markup=kb.how_to_order_keyboard(),
+            )
+        except Exception:
+            # Sama seperti show_vip/back_main -- kalau pesan sumbernya foto
+            # (mis. dari layar scan QRIS), edit_message_text tidak berlaku.
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                query.message.chat_id, text, parse_mode=ParseMode.HTML,
+                reply_markup=kb.how_to_order_keyboard(),
+            )
+
+    elif query.data == "my_status":
+        vip = db.get_vip(query.from_user.id)
+        if vip and vip["expiry_date"]:
+            expiry = datetime.datetime.fromisoformat(vip["expiry_date"])
+            if expiry > datetime.datetime.utcnow():
+                sisa = expiry - datetime.datetime.utcnow()
+                text = (
+                    f"✅ Status VIP: *AKTIF*\n"
+                    f"Berlaku sampai: {expiry.strftime('%d %B %Y %H:%M')} UTC\n"
+                    f"Sisa waktu: {sisa.days} hari"
+                )
+            else:
+                text = "❌ VIP kamu sudah *habis masa berlakunya*. Silakan perpanjang."
+        else:
+            text = "Kamu belum memiliki status VIP. Yuk pilih paket dulu!"
+        await fade_transition(
+            query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb.main_menu_keyboard()
+        )
+
+
+# Tombol "buy_<id>" SENGAJA TIDAK lagi ditangani di sini (lihat buy_start() &
+# promo_purchase_conv di dekat start_purchase_flow) -- dipindah jadi entry
+# point ConversationHandler tersendiri supaya bisa menyisipkan 1 langkah
+# opsional "mau pakai kode promo?" sebelum QRIS dikirim, kalau fitur kode
+# promo sedang aktif.
+
+
+class _StoredBuyer:
+    """Objek ringan pengganti telegram.User, dipakai untuk diteruskan ke
+    start_purchase_flow() dari state manapun di promo_purchase_conv (PROMO_CHOICE/
+    PROMO_INPUT_WAIT) tanpa perlu menyimpan objek User Telegram asli ke
+    context.user_data -- dihindari supaya tetap aman kalau suatu saat PTB
+    persistence diaktifkan (objek Telegram tidak selalu bisa di-pickle)."""
+    __slots__ = ("id", "username", "first_name")
+
+    def __init__(self, user_id: int, display_name: str):
+        self.id = user_id
+        self.username = display_name
+        self.first_name = display_name
+
+
+class _DeletableMessageRef:
+    """Pengganti ringan objek Message asli, cukup untuk dipanggil .delete()
+    oleh start_purchase_flow() -- dipakai karena promo_purchase_conv sengaja
+    HANYA menyimpan chat_id+message_id (bukan objek Message itu sendiri) ke
+    context.user_data di antara state-state-nya."""
+
+    def __init__(self, bot, chat_id, message_id):
+        self._bot, self._chat_id, self._message_id = bot, chat_id, message_id
+
+    async def delete(self):
+        await self._bot.delete_message(self._chat_id, self._message_id)
+
+
+async def _complete_purchase(context: ContextTypes.DEFAULT_TYPE, discount_amount: int = 0):
+    """Titik akhir bersama promo_purchase_conv -- dipanggil dari buy_start()
+    (langsung, kalau promo nonaktif), promo_purchase_skip(), dan
+    promo_code_receive(), lalu benar-benar memanggil start_purchase_flow()."""
+    pkg_id = context.user_data.pop("buy_pkg_id", None)
+    chat_id = context.user_data.pop("buy_chat_id", None)
+    msg_id = context.user_data.pop("buy_msg_id", None)
+    display_name = context.user_data.pop("buy_display_name", None)
+    if pkg_id is None or chat_id is None:
+        return
+
+    telegram_user = _StoredBuyer(chat_id, display_name or str(chat_id))
+    source_message = _DeletableMessageRef(context.bot, chat_id, msg_id) if msg_id is not None else None
+
+    await start_purchase_flow(
+        chat_id, telegram_user, context, pkg_id,
+        source_message=source_message, discount_amount=discount_amount,
+    )
+
+
+async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point ConversationHandler promo_purchase_conv untuk tombol
+    "buy_<id>". Kalau promo SEDANG AKTIF & punya kode berjalan, tampilkan 1
+    langkah opsional "mau pakai kode promo?" dulu -- kalau tidak, perilakunya
+    identik seperti sebelum fitur promo ada (langsung ke QRIS)."""
+    query = update.callback_query
+    await query.answer()
+    pkg_id = int(query.data.split("_")[1])
+
+    pkg = db.get_package(pkg_id)
+    # Tombol ini bisa berasal dari pesan normal (query.message ada) ATAU dari
+    # hasil answerWebAppQuery Mini App (query.message TIDAK ADA sama sekali,
+    # lihat https://core.telegram.org/bots/api#callbackquery) -- untuk kasus
+    # kedua, chat_id diambil dari query.from_user.id (aman karena alur ini
+    # SELALU di private chat 1-on-1, dan di Telegram chat_id private chat ==
+    # user_id lawan bicaranya).
+    target_chat = query.message.chat_id if query.message is not None else query.from_user.id
+    if not pkg:
+        await context.bot.send_message(target_chat, "Paket tidak ditemukan / sudah tidak aktif.")
+        return ConversationHandler.END
+
+    context.user_data["buy_pkg_id"] = pkg_id
+    context.user_data["buy_chat_id"] = target_chat
+    context.user_data["buy_msg_id"] = query.message.message_id if query.message is not None else None
+    context.user_data["buy_display_name"] = (
+        query.from_user.username or query.from_user.first_name or str(query.from_user.id)
+    )
+
+    st = promo_status()
+    if not (st["enabled"] and st["code"]):
+        await _complete_purchase(context, discount_amount=0)
+        return ConversationHandler.END
+
+    text = (
+        f"🎟️ Ada kode promo diskon <b>Rp{rupiah(st['discount'])}</b> untuk paket "
+        f"<b>{html.escape(pkg['name'])}</b> yang sedang berlangsung. Punya kodenya?"
+    )
+    markup = InlineKeyboardMarkup([
+        [make_button("🎟️ Pakai Kode Promo", callback_data=f"promo_enter_{pkg_id}", style="success")],
+        [make_button("➡️ Lanjut Tanpa Promo", callback_data=f"promo_skip_{pkg_id}", style="primary")],
+    ])
+    if query.message is not None:
+        try:
+            await fade_transition(query, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(target_chat, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    else:
+        await context.bot.send_message(target_chat, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    return PROMO_CHOICE
+
+
+async def promo_purchase_enter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tombol "🎟️ Pakai Kode Promo" dipencet -- minta user ketik kodenya."""
+    query = update.callback_query
+    await query.answer()
+    pkg_id = context.user_data.get("buy_pkg_id")
+    text = "🎟️ Ketik kode promo kamu (mis. <code>PROMO-AB12CD</code>):"
+    markup = InlineKeyboardMarkup([
+        [make_button("➡️ Lewati, Lanjut Tanpa Promo", callback_data=f"promo_skip_{pkg_id}", style="primary")],
+    ])
+    if query.message is not None:
+        try:
+            await fade_transition(query, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:
+            await context.bot.send_message(query.message.chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    else:
+        await context.bot.send_message(query.from_user.id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    return PROMO_INPUT_WAIT
+
+
+async def promo_purchase_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tombol "➡️ Lanjut Tanpa Promo" -- dipakai dari PROMO_CHOICE maupun
+    PROMO_INPUT_WAIT (kalau user berubah pikiran setelah diminta ketik kode)."""
+    query = update.callback_query
+    await query.answer()
+    await _complete_purchase(context, discount_amount=0)
+    return ConversationHandler.END
+
+
+async def promo_code_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User mengetik kode promo saat checkout -- divalidasi lewat
+    apply_promo_code() (kode aktif, kuota, dst), lalu lanjut ke QRIS dengan
+    harga terpotong (kode valid) atau harga normal (kode salah/kadaluarsa) --
+    kode yang tidak valid TIDAK PERNAH memblokir pembelian."""
+    discount, message = apply_promo_code(update.message.text, update.effective_user)
+    await update.message.reply_text(message)
+    await _complete_purchase(context, discount_amount=discount)
+    return ConversationHandler.END
+
+
+async def start_purchase_flow(chat_id: int, telegram_user, context: ContextTypes.DEFAULT_TYPE,
+                               pkg_id: int, source_message=None, discount_amount: int = 0):
+    """Alur mulai pembelian paket (buat transaksi + kirim QRIS & nominal unik).
+
+    Direfactor jadi fungsi terpisah (bukan inline di dalam handler tombol)
+    supaya bisa dipakai dari DUA sumber trigger yang beda bentuknya:
+    1. Tombol inline biasa "buy_<id>" (callback query, ada `query.message`),
+       sekarang lewat ConversationHandler promo_purchase_conv (buy_start dst)
+       supaya bisa menyisipkan langkah opsional input kode promo dulu.
+    2. Data dari Telegram Mini App "Lihat Paket VIP" (pesan biasa berisi
+       `web_app_data`, TIDAK ada callback query/`query.message` sama sekali)
+       -- lihat handle_webapp_data() di bawah. Jalur Mini App SENGAJA tidak
+       ditawari kode promo (keterbatasan UI Mini App eksternal), discount_amount
+       selalu 0 dari jalur ini.
+
+    `source_message`, kalau diisi, akan dihapus setelah QRIS terkirim (dipakai
+    supaya pesan daftar paket lama tidak menumpuk di chat -- perilaku yang
+    sama seperti sebelum refactor ini).
+
+    `discount_amount`, kalau > 0 (kode promo valid, lihat apply_promo_code()),
+    dipotong dari harga dasar paket SEBELUM nominal unik dihitung -- supaya
+    potongannya ikut ter-embed di nominal QRIS/transfer, bukan cuma catatan
+    di layar."""
+    pkg = db.get_package(pkg_id)
+    if not pkg:
+        await context.bot.send_message(chat_id, "Paket tidak ditemukan / sudah tidak aktif.")
+        return
+
+    base_price = max(0, pkg["price"] - max(0, discount_amount))
+
+    # Buat transaksi DULU dengan nominal sementara (harga dasar setelah
+    # potongan promo kalau ada, belum ada kode unik) supaya dapat `tx_id`
+    # dari database -- baru kode unik & nominal final dihitung BERBASIS
+    # `tx_id` ini (lihat generate_unique_code() & database.set_transaction_amount()
+    # untuk alasan kenapa harus begini, bukan pakai counter di memori seperti
+    # sebelumnya).
+    username = telegram_user.username or telegram_user.first_name
+    tx_id = db.create_transaction(telegram_user.id, username, pkg_id, base_price, "")
+    context.user_data["pending_tx_id"] = tx_id
+
+    final_amount, unique_code = generate_unique_code(base_price, tx_id)
+    db.set_transaction_amount(tx_id, final_amount, unique_code)
+
+    qris_path = config.QRIS_IMAGE_PATH
+    caption_template = db.get_setting("qris_caption_text", db.DEFAULT_QRIS_CAPTION)
+    caption = render_template(
+        caption_template,
+        package=pkg["name"],
+        duration=pkg["duration_days"],
+        amount=rupiah(final_amount),
+    )
+    if discount_amount > 0:
+        caption += f"\n\n🎟️ <i>Sudah termasuk potongan kode promo Rp{rupiah(discount_amount)}.</i>"
+
+    # Kalau QRIS statis berhasil di-decode saat admin upload (lihat save_qris()),
+    # kita generate QRIS DINAMIS baru dengan nominal `final_amount` SUDAH
+    # ter-embed di dalam kode QR-nya -- user tinggal scan & konfirmasi bayar
+    # di app-nya, TANPA perlu mengetik nominal manual sama sekali. Nominal unik
+    # (unique_code) tetap dipakai persis seperti sebelumnya untuk pencocokan
+    # otomatis lewat verify_proof_locally() (nama+tanggal+nominal, lihat di
+    # bawah) -- cuma cara usernya bayar yang berubah jadi lebih gampang.
+    static_qris_string = db.get_setting("qris_static_string", "")
+    dynamic_qris_sent = False
+
+    if static_qris_string:
+        try:
+            dynamic_str = qris_dinamis.inject_amount(static_qris_string, final_amount)
+            dynamic_qris_path = os.path.join(
+                os.path.dirname(config.QRIS_IMAGE_PATH) or ".", f"qris_dinamis_tx{tx_id}.png"
+            )
+            qris_dinamis.generate_qris_image(dynamic_str, dynamic_qris_path)
+            with open(dynamic_qris_path, "rb") as f:
+                await context.bot.send_photo(
+                    chat_id, photo=f, caption=caption, parse_mode=ParseMode.HTML,
+                    reply_markup=kb.qris_back_keyboard(),
+                )
+            dynamic_qris_sent = True
+            try:
+                os.remove(dynamic_qris_path)
+            except OSError:
+                pass
+        except Exception as e:
+            logger.error(f"Gagal generate QRIS dinamis untuk TX #{tx_id}, fallback ke QRIS statis: {e}")
+            # Lanjut ke fallback di bawah -- jangan biarkan user tidak dapat QRIS sama sekali.
+
+    if not dynamic_qris_sent:
+        # Fallback: cara lama (QRIS statis + minta user transfer nominal
+        # unik secara manual) -- dipakai kalau admin belum pernah upload QRIS
+        # sejak fitur nominal-otomatis ini ada, atau generate QRIS dinamis
+        # gagal karena sebab lain (mis. file gambar QRIS hilang/rusak).
+        if os.path.exists(qris_path):
+            with open(qris_path, "rb") as f:
+                await context.bot.send_photo(
+                    chat_id, photo=f, caption=caption, parse_mode=ParseMode.HTML,
+                    reply_markup=kb.qris_back_keyboard(),
+                )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                caption + "\n\n<i>(QRIS belum diset oleh admin, hubungi admin untuk kode QRIS)</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb.qris_back_keyboard(),
+            )
+
+    if source_message is not None:
+        try:
+            await source_message.delete()
+        except Exception:
+            pass
+
+
+async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ditrigger saat user pilih paket dari Mini App "Lihat Paket VIP" (halaman
+    HTML statis, mis. di-hosting GitHub Pages) -- WebApp mengirim data lewat
+    `Telegram.WebApp.sendData(...)` di sisi JS, yang sampai ke bot sebagai
+    pesan biasa berisi `web_app_data` (BUKAN callback query)."""
+    try:
+        payload = json.loads(update.effective_message.web_app_data.data)
+        pkg_id = int(payload["package_id"])
+    except Exception:
+        await update.effective_message.reply_text(
+            "Data dari halaman paket tidak terbaca. Coba buka lagi & pilih paketnya."
+        )
+        return
+    await start_purchase_flow(update.effective_chat.id, update.effective_user, context, pkg_id)
+
+
+def _chunk_link_buttons(links: list, per_row: int = 2) -> list:
+    """Susun list (label, url) jadi baris tombol inline, `per_row` tombol per
+    baris, supaya pesan paket kolektif dengan banyak link (mis. 16 link) tidak
+    jadi 1 tombol per baris yang kepanjangan ke bawah."""
+    rows, row = [], []
+    for i, (_, url) in enumerate(links, start=1):
+        row.append(make_button(f"Link {i}", url=url, style="success"))
+        if len(row) == per_row:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return rows
+
+
+async def send_package_link(chat_id: int, context: ContextTypes.DEFAULT_TYPE, pkg):
+    """Kirim akses VIP ke user sesuai paket yang dipesan.
+
+    - PAKET KOLEKTIF (ada baris di tabel package_channels, mis. "Paket 16 Link"):
+      bot MEMBUAT SENDIRI satu invite link 1x-pakai (member_limit=1) untuk
+      SETIAP channel yang terdaftar di paket itu, lalu mengirim SEMUA link
+      sekaligus dalam satu pesan. Tiap link tetap eksklusif untuk 1 orang,
+      persis seperti paket biasa -- cuma jumlahnya banyak dalam 1x kirim.
+      Dicek PALING AWAL karena prioritasnya di atas target_chat_id tunggal.
+    - Kalau paket sudah diset `target_chat_id` (grup/channel Telegram) TAPI
+      TIDAK punya channel kolektif, bot akan MEMBUAT SENDIRI link undangan
+      baru yang HANYA BERLAKU UNTUK 1 ORANG (member_limit=1) khusus untuk
+      pembelian ini, lalu mengirimkannya. Link lama tidak pernah dipakai
+      ulang, jadi tidak bisa dibagikan/dipakai orang lain.
+    - Kalau paket hanya diset link statis (bukan grup Telegram yang bot kelola),
+      bot mengirim link itu apa adanya — TIDAK bisa dibatasi otomatis oleh bot,
+      karena bot cuma bisa membuat & membatasi invite link untuk chat Telegram
+      yang bot sendiri jadi salah satu adminnya.
+    - Kalau paket tidak punya link sendiri (kolom `link` kosong), bot otomatis
+      memakai *link akses statis global* yang diset SEKALI lewat /settings
+      (tombol "🔗 Atur Link Akses Statis (Global)"), supaya admin tidak perlu
+      input link yang sama berulang-ulang untuk tiap paket baru.
+    """
+    collective_channels = db.list_package_channels(pkg["id"])
+    if collective_channels:
+        links, failed = [], []
+        for ch in collective_channels:
+            try:
+                invite = await context.bot.create_chat_invite_link(
+                    chat_id=int(ch["chat_id"]),
+                    member_limit=1,
+                    name=f"VIP-{pkg['name']}-{chat_id}"[:32],
+                )
+                links.append((ch["label"] or pkg["name"], invite.invite_link))
+            except Exception as e:
+                logger.error(
+                    f"Gagal membuat invite link kolektif utk paket {pkg['name']} "
+                    f"channel {ch['chat_id']}: {e}"
+                )
+                failed.append(ch["chat_id"])
+
+        if links:
+            body = "\n".join(
+                f"{i}. {html.escape(label)}\n{html.escape(url)}"
+                for i, (label, url) in enumerate(links, start=1)
+            )
+            # PENTING: HTML, bukan Markdown -- sama seperti alasan di jalur
+            # single-link di bawah, invite link Telegram hampir selalu
+            # mengandung underscore.
+            await context.bot.send_message(
+                chat_id,
+                f"🔗 <b>Akses {html.escape(pkg['name'])}</b> ({len(links)} link)\n\n{body}\n\n"
+                f"<i>Setiap link di atas dibuat khusus untukmu dan hanya bisa dipakai 1 kali "
+                f"oleh 1 akun. Jangan dibagikan ke orang lain karena akan otomatis tidak "
+                f"berlaku lagi setelah dipakai.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(_chunk_link_buttons(links)),
+            )
+        if failed:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ {len(failed)} dari {len(collective_channels)} link gagal dibuat otomatis. "
+                "Admin akan mengirimkan sisanya secara manual.",
+            )
+            if config.LOG_CHAT_ID:
+                await context.bot.send_message(
+                    config.LOG_CHAT_ID,
+                    f"⚠️ Gagal membuat {len(failed)} invite link kolektif untuk paket "
+                    f"'{pkg['name']}' (chat_id: {', '.join(str(f) for f in failed)}). "
+                    f"Pastikan bot sudah jadi admin dengan izin 'Invite Users via Link' "
+                    f"di semua channel/grup tersebut.",
+                )
+        return
+
+    target_chat_id = (pkg["target_chat_id"] or "").strip()
+
+    if target_chat_id:
+        try:
+            invite = await context.bot.create_chat_invite_link(
+                chat_id=int(target_chat_id),
+                member_limit=1,
+                name=f"VIP-{pkg['name']}-{chat_id}"[:32],
+            )
+            # PENTING: pakai HTML, BUKAN Markdown, untuk pesan ini -- invite
+            # link Telegram (contoh: https://t.me/+AbC_dEfGh...) hampir selalu
+            # mengandung underscore, dan Markdown versi lama (legacy) akan
+            # menganggap SATU underscore sebagai pembuka teks miring. Karena
+            # tidak ada underscore penutup pasangannya, Telegram akan menolak
+            # parsing seluruh pesan dengan error "Can't parse entities: can't
+            # find end of the entity..." -- lalu error itu keliru "disalahkan"
+            # ke create_chat_invite_link() di atas oleh except block, padahal
+            # invite link-nya sendiri sudah berhasil dibuat. HTML tidak
+            # bermasalah dengan underscore, jadi aman dipakai di sini.
+            await context.bot.send_message(
+                chat_id,
+                f"🔗 <b>Akses {html.escape(pkg['name'])}</b>\n{html.escape(invite.invite_link)}\n\n"
+                f"<i>Link ini dibuat khusus untukmu dan hanya bisa dipakai 1 kali oleh 1 akun. "
+                f"Jangan bagikan ke orang lain karena akan otomatis tidak berlaku lagi setelah dipakai.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [[make_button(f"Buka {pkg['name']}", url=invite.invite_link, style="success")]]
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Gagal membuat invite link untuk paket {pkg['name']} (chat_id {target_chat_id}): {e}")
+            await context.bot.send_message(
+                chat_id,
+                "⚠️ Pembayaran kamu sudah *berhasil*, tapi bot gagal membuat link akses "
+                "otomatis. Admin akan segera mengirimkan link akses secara manual.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            if config.LOG_CHAT_ID:
+                await context.bot.send_message(
+                    config.LOG_CHAT_ID,
+                    f"⚠️ Gagal membuat invite link otomatis untuk paket '{pkg['name']}' "
+                    f"(chat_id {target_chat_id}). Pastikan bot sudah jadi admin dengan izin "
+                    f"'Invite Users via Link' di grup/channel tersebut.\nError: {e}",
+                )
+        return
+
+    # Prioritas: link khusus paket (kolom `link`) -> kalau kosong, pakai link
+    # akses statis GLOBAL yang diset sekali lewat /settings.
+    link = (pkg["link"] or "").strip()
+    if not link:
+        link = db.get_setting("static_access_link", "").strip()
+    if not link:
+        return
+    is_url = link.startswith("http://") or link.startswith("https://")
+    await context.bot.send_message(
+        chat_id,
+        f"🔗 <b>Akses {html.escape(pkg['name'])}</b>\n{html.escape(link)}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [[make_button(f"Buka {pkg['name']}", url=link, style="success")]]
+        ) if is_url else None,
+    )
+
+
+# ── Terima & verifikasi bukti transfer (100% lokal, tanpa pihak ketiga) ──
+
+def verify_proof_locally(ocr_result: dict, expected_amount: int) -> tuple[bool, str]:
+    """Cocokkan hasil OCR bukti transfer ke 3 hal, MURNI lokal (tanpa API/
+    notifikasi pihak ketiga mana pun):
+    1. Nominal harus PERSIS sama dengan `expected_amount` (termasuk kode unik).
+    2. Nama penerima (config.QRIS_RECIPIENT_NAME) harus terdeteksi di teks OCR
+       (fuzzy match, lihat ocr_utils.name_matches) -- dilewati kalau admin
+       belum mengisi QRIS_RECIPIENT_NAME.
+    3. Tanggal transaksi (kalau terbaca) harus dalam rentang toleransi
+       config.PROOF_DATE_TOLERANCE_HOURS jam dari sekarang -- mencegah bukti
+       transfer lama/daur ulang dari transaksi lain.
+
+    Return (matched: bool, reason: str) -- `reason` diisi HANYA kalau
+    matched=False, untuk ditampilkan sebagai alasan reject ke user/admin."""
+    if ocr_result["amount"] != expected_amount:
+        return False, "Nominal pada bukti transfer tidak sesuai / tidak terbaca."
+
+    if not ocr_utils.name_matches(config.QRIS_RECIPIENT_NAME, ocr_result["raw_text"]):
+        return False, "Nama penerima pada bukti transfer tidak cocok dengan nama penerima QRIS terdaftar."
+
+    proof_date = ocr_result.get("date")
+    if proof_date is not None:
+        now = datetime.datetime.utcnow()
+        delta_hours = abs((now - proof_date).total_seconds()) / 3600
+        if delta_hours > config.PROOF_DATE_TOLERANCE_HOURS:
+            return False, (
+                f"Tanggal/jam pada bukti transfer ({proof_date.strftime('%d %B %Y %H:%M')}) "
+                f"di luar batas wajar (lebih dari {config.PROOF_DATE_TOLERANCE_HOURS} jam dari sekarang)."
+            )
+
+    return True, ""
+
+
+async def handle_proof_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tx_id = context.user_data.get("pending_tx_id")
+    if not tx_id:
+        tx = db.get_pending_transaction_for_user(update.effective_user.id)
+        if not tx:
+            await update.message.reply_text(
+                "Sepertinya kamu belum memilih paket VIP. Ketik /start untuk mulai."
+            )
+            return
+        tx_id = tx["id"]
+
+    tx = db.get_transaction(tx_id)
+    if not tx:
+        await update.message.reply_text("Transaksi tidak ditemukan atau sudah diproses sebelumnya.")
+        return
+    if tx["status"] == "approved":
+        # Transaksi ini sudah berstatus approved sebelumnya (misalnya admin sudah
+        # approve manual lewat fallback review, atau ini foto kedua yang dikirim
+        # untuk transaksi yang sama yang sudah selesai diproses). Bukti transfer
+        # tetap boleh dikirim untuk arsip, tapi tidak perlu diproses ulang.
+        await update.message.reply_text(
+            "✅ Transaksi ini sudah *terverifikasi* sebelumnya. "
+            "Bukti transfer ini tidak perlu diproses lagi — kalau VIP kamu belum aktif, hubungi admin.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if tx["status"] != "pending":
+        await update.message.reply_text("Transaksi tidak ditemukan atau sudah diproses sebelumnya.")
+        return
+
+    pkg = db.get_package(tx["package_id"])
+    user = update.effective_user
+    username_display = f"@{user.username}" if user.username else user.first_name
+
+    processing_msg = await update.message.reply_text("🔍 Memproses bukti transfer, mohon tunggu sebentar...")
+    proof_anim_task = asyncio.create_task(
+        animate_processing(processing_msg, "🔍 Memproses bukti transfer")
+    )
+
+    # Download foto (disimpan di PROOF_IMAGES_DIR, yang ada di dalam DATA_DIR / Railway Volume)
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    local_path = os.path.join(config.PROOF_IMAGES_DIR, f"proof_{tx_id}.jpg")
+    await file.download_to_drive(local_path)
+
+    # ── Log bukti transfer ke grup log SEGERA setelah diterima ──
+    if config.LOG_CHAT_ID:
+        await context.bot.send_photo(
+            config.LOG_CHAT_ID,
+            photo=photo.file_id,
+            caption=(
+                f"📥 *Bukti transfer masuk*\n"
+                f"TX #{tx_id} | User: {user.id} ({username_display})\n"
+                f"Paket: {pkg['name']} | Nominal diharapkan: Rp{tx['expected_amount']:,}\n"
+                f"Sedang diverifikasi otomatis...".replace(",", ".")
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    # 1) Hash gambar — deteksi kalau bukti ini PERSIS SAMA dengan yang pernah dipakai
+    #    di transaksi lain (indikasi kuat bukti daur ulang / dibagikan antar user)
+    image_hash = ocr_utils.compute_image_hash(local_path)
+    duplicate_tx = db.check_duplicate_image_hash(image_hash, exclude_tx_id=tx_id)
+
+    # 2) OCR
+    ocr_result = ocr_utils.analyze_proof(local_path)
+    db.attach_proof(tx_id, photo.file_id, ocr_result["amount"], ocr_result["raw_text"], image_hash)
+
+    if duplicate_tx:
+        # ── TERDETEKSI BUKTI DAUR ULANG / KEMUNGKINAN PALSU ──
+        reason = f"Gambar bukti transfer identik dengan TX #{duplicate_tx['id']} yang sudah pernah diproses sebelumnya."
+        db.set_transaction_status(tx_id, "rejected", reject_reason=reason)
+        strike_count = db.increment_strike(user.id)
+
+        warning_text = (
+            "⚠️ *PERINGATAN KERAS*\n\n"
+            "Bukti transfer yang kamu kirim terdeteksi *identik* dengan bukti transfer yang "
+            "sudah pernah dipakai sebelumnya di transaksi lain. Mengirim ulang bukti transfer "
+            "lama, hasil editan, atau bukti milik orang lain untuk mendapatkan akses VIP adalah "
+            "*pelanggaran serius* dan tidak akan diproses.\n\n"
+            f"Ini adalah pelanggaran ke-*{strike_count}* yang tercatat dari akun kamu. "
+            "Pelanggaran yang berulang dapat mengakibatkan akun kamu *diblokir secara permanen* "
+            "dari layanan ini.\n\n"
+            "Kalau kamu merasa ini kesalahan, silakan hubungi admin untuk klarifikasi."
+        )
+        await stop_processing_animation(proof_anim_task)
+        await processing_msg.edit_text(warning_text, parse_mode=ParseMode.MARKDOWN)
+
+        if config.LOG_CHAT_ID:
+            await context.bot.send_message(
+                config.LOG_CHAT_ID,
+                f"🚨 *TERDETEKSI BUKTI TRANSFER DUPLIKAT/PALSU*\n"
+                f"TX #{tx_id} | User: {user.id} ({username_display})\n"
+                f"Duplikat persis dari TX #{duplicate_tx['id']}\n"
+                f"Total pelanggaran user ini sejauh ini: *{strike_count}*"
+                + (
+                    "\n\n⚠️ *User ini sudah melewati ambang batas pelanggaran, mohon ditinjau/diblokir manual.*"
+                    if strike_count >= config.FRAUD_STRIKE_ALERT_THRESHOLD else ""
+                ),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        context.user_data.pop("pending_tx_id", None)
+        return
+
+    # 3) Verifikasi 100% LOKAL: cocokkan nama penerima + tanggal + nominal,
+    #    semua murni dari hasil OCR gambar ini sendiri -- TIDAK ada panggilan
+    #    ke API/pihak ketiga mana pun.
+    matched, mismatch_reason = verify_proof_locally(ocr_result, tx["expected_amount"])
+
+    if matched:
+        # ── Kirim status berhasil ke grup log DULU, baru approve ──
+        if config.LOG_CHAT_ID:
+            await context.bot.send_message(
+                config.LOG_CHAT_ID,
+                f"✅ *Status Pembayaran: BERHASIL*\n"
+                f"TX #{tx_id} | User: {user.id} ({username_display})\n"
+                f"Paket: {pkg['name']} | Rp{tx['expected_amount']:,}\n"
+                f"Terverifikasi via: OCR lokal (nama+tanggal+nominal)".replace(",", "."),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+        # ── AUTO APPROVE ──
+        db.set_transaction_status(tx_id, "approved")
+        expiry = db.grant_vip(user.id, user.username or "", tx["package_id"], pkg["duration_days"])
+
+        success_template = db.get_setting("payment_success_text", db.DEFAULT_PAYMENT_SUCCESS)
+        success_text = render_template(
+            success_template,
+            package=pkg["name"],
+            duration=pkg["duration_days"],
+            amount=rupiah(tx["expected_amount"]),
+            expiry=f"{expiry.strftime('%d %B %Y %H:%M')} UTC",
+        )
+        await stop_processing_animation(proof_anim_task)
+        await processing_msg.edit_text(success_text, parse_mode=ParseMode.HTML, reply_markup=result_kb())
+        await send_package_link(update.effective_chat.id, context, pkg)
+        await post_testimonial(context, tx, pkg)
+
+    else:
+        # ── AUTO REJECT ──
+        reason = mismatch_reason
+        db.set_transaction_status(tx_id, "rejected", reject_reason=reason)
+        reject_template = db.get_setting("payment_reject_text", db.DEFAULT_PAYMENT_REJECT)
+        reject_text = render_template(
+            reject_template,
+            package=pkg["name"],
+            amount=rupiah(tx["expected_amount"]),
+            reason=reason,
+        )
+        await stop_processing_animation(proof_anim_task)
+        await processing_msg.edit_text(reject_text, parse_mode=ParseMode.HTML, reply_markup=result_kb())
+        if config.LOG_CHAT_ID:
+            await context.bot.send_message(
+                config.LOG_CHAT_ID,
+                f"❌ *Auto-rejected*\n"
+                f"TX #{tx_id} | User: {user.id} ({username_display})\n{reason}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb.confirm_proof_keyboard(tx_id),
+            )
+
+    context.user_data.pop("pending_tx_id", None)
+
+
+# ── Auto-posting testimoni bukti transfer (approved) ke channel testi ───────
+
+def proof_image_path(tx_id: int) -> str:
+    """Path lokal bukti transfer yang di-download saat handle_proof_photo()
+    (selalu di-download apa pun hasil verifikasinya, jadi masih ada di sini
+    baik untuk approve otomatis maupun approve manual admin belakangan)."""
+    return os.path.join(config.PROOF_IMAGES_DIR, f"proof_{tx_id}.jpg")
+
+
+async def post_testimonial(context: ContextTypes.DEFAULT_TYPE, tx, pkg):
+    """Posting otomatis bukti transfer yang baru saja di-APPROVE ke channel
+    testi (config.TESTI_CHANNEL_ID). Urutan pemrosesan gambar: SENSOR dulu
+    (no. rekening & nama pengirim dihitamkan, lihat ocr_utils.censor_sensitive_info
+    -- demi privasi pembeli, karena publik yang lihat testimoni tidak perlu tahu
+    itu), BARU watermark transparan (dikonversi dari stiker yang diset admin
+    lewat /settings) ditempel di tengah gambar. Caption berisi nama paket + #testi.
+
+    Sengaja TIDAK pernah melempar exception ke pemanggil: kalau channel belum
+    diset, watermark belum diset, atau bot gagal posting (mis. bukan admin di
+    channel tsb), fitur ini cukup dilewati/dicatat ke log saja — TIDAK BOLEH
+    menggagalkan proses approve transaksi & pengiriman VIP ke user."""
+    if not config.TESTI_CHANNEL_ID:
+        return
+
+    proof_path = proof_image_path(tx["id"])
+    if not os.path.exists(proof_path):
+        logger.warning(f"Testi: bukti transfer TX #{tx['id']} tidak ditemukan di {proof_path}, lewati posting testi.")
+        return
+
+    output_path = proof_path
+    try:
+        # 1) Sensor dulu (no. rekening/nama pengirim) -- kalau gagal (mis. OCR
+        # layout tidak terbaca), tetap lanjut pakai gambar asli (belum tersensor)
+        # daripada tidak posting sama sekali.
+        try:
+            censored_path = os.path.join(config.PROOF_IMAGES_DIR, f"censored_{tx['id']}.jpg")
+            ocr_utils.censor_sensitive_info(proof_path, censored_path)
+            output_path = censored_path
+        except Exception as e:
+            logger.warning(f"Testi: gagal sensor info sensitif TX #{tx['id']}, pakai gambar asli: {e}")
+            output_path = proof_path
+
+        # 2) Baru tempel watermark di atas hasil sensor (kalau watermark belum
+        # diset admin, tetap posting apa adanya -- sudah tersensor -- daripada
+        # tidak posting sama sekali).
+        if os.path.exists(config.WATERMARK_IMAGE_PATH):
+            watermarked_path = os.path.join(config.PROOF_IMAGES_DIR, f"testi_{tx['id']}.jpg")
+            watermark.apply_watermark(output_path, config.WATERMARK_IMAGE_PATH, watermarked_path)
+            output_path = watermarked_path
+
+        caption_template = db.get_setting("testi_caption_text", db.DEFAULT_TESTI_CAPTION)
+        caption = render_template(caption_template, package=pkg["name"])
+
+        with open(output_path, "rb") as f:
+            await context.bot.send_photo(
+                config.TESTI_CHANNEL_ID, photo=f, caption=caption, parse_mode=ParseMode.HTML
+            )
+    except Exception as e:
+        logger.error(f"Gagal posting testimoni TX #{tx['id']} ke channel testi: {e}")
+        if config.LOG_CHAT_ID:
+            await context.bot.send_message(
+                config.LOG_CHAT_ID,
+                f"⚠️ Gagal auto-posting testimoni TX #{tx['id']} ke channel testi.\n"
+                f"Pastikan TESTI_CHANNEL_ID benar & bot sudah jadi admin (dengan izin post) "
+                f"di channel tsb.\nError: {e}",
+            )
+
+
+# ── Fallback manual admin (khusus kasus butuh review, lihat handler di atas) ─
+
+async def admin_manual_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Khusus admin.", show_alert=True)
+        return
+
+    action, tx_id = query.data.rsplit("_", 1)
+    tx_id = int(tx_id)
+    tx = db.get_transaction(tx_id)
+    if not tx:
+        await query.edit_message_text("Transaksi tidak ditemukan.")
+        return
+
+    pkg = db.get_package(tx["package_id"])
+
+    if action == "admin_approve":
+        db.set_transaction_status(tx_id, "approved")
+        expiry = db.grant_vip(tx["user_id"], tx["username"], tx["package_id"], pkg["duration_days"])
+        success_template = db.get_setting("payment_success_text", db.DEFAULT_PAYMENT_SUCCESS)
+        success_text = render_template(
+            success_template,
+            package=pkg["name"],
+            duration=pkg["duration_days"],
+            amount=rupiah(tx["expected_amount"]),
+            expiry=f"{expiry.strftime('%d %B %Y %H:%M')} UTC",
+        )
+        await context.bot.send_message(tx["user_id"], success_text, parse_mode=ParseMode.HTML, reply_markup=result_kb())
+        await send_package_link(tx["user_id"], context, pkg)
+        await post_testimonial(context, tx, pkg)
+        await query.edit_message_text(f"✅ TX #{tx_id} disetujui manual oleh admin.")
+    else:
+        reason = "Ditolak manual oleh admin"
+        db.set_transaction_status(tx_id, "rejected", reject_reason=reason)
+        reject_template = db.get_setting("payment_reject_text", db.DEFAULT_PAYMENT_REJECT)
+        reject_text = render_template(
+            reject_template,
+            package=pkg["name"],
+            amount=rupiah(tx["expected_amount"]),
+            reason=reason,
+        )
+        await context.bot.send_message(tx["user_id"], reject_text, parse_mode=ParseMode.HTML, reply_markup=result_kb())
+        await query.edit_message_text(f"❌ TX #{tx_id} ditolak manual oleh admin.")
+
+
+# ── /settings (khusus admin) ─────────────────────────────────────────────
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return ConversationHandler.END
+    await update.message.reply_text("⚙️✨ *Menu Pengaturan Bot*", parse_mode=ParseMode.MARKDOWN, reply_markup=settings_menu_kb())
+    return ConversationHandler.END
+
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pintasan /broadcast -- langsung masuk ke alur broadcast tanpa perlu
+    buka /settings dan tekan tombol "📢💎 Broadcast Pesan" dulu. Teks
+    instruksinya SENGAJA disamakan persis dengan yang ditampilkan lewat
+    tombol settings_broadcast (lihat settings_router()), supaya kedua jalur
+    masuk terasa konsisten."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Perintah ini khusus admin.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "📢💎 *Broadcast Pesan*\n\n"
+        "Kirim pesan yang mau di-broadcast ke *semua user* yang pernah "
+        "bertransaksi/VIP (boleh teks biasa, atau foto + caption).\n\n"
+        "💎 Bold/italic dan emoji premium yang kamu pakai langsung di chat ini "
+        "akan ikut tampil ke user (tidak perlu isi ID emoji manual).",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_kb(),
+    )
+    return BROADCAST_WAIT
+
+
+async def settings_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Khusus admin.", show_alert=True)
+        return ConversationHandler.END
+
+    data = query.data
+
+    if data == "settings_close":
+        await query.edit_message_text("Menu settings ditutup.")
+        return ConversationHandler.END
+
+    if data == "settings_back":
+        await fade_transition(query, "⚙️✨ *Menu Pengaturan Bot*", parse_mode=ParseMode.MARKDOWN, reply_markup=settings_menu_kb())
+        return ConversationHandler.END
+
+    if data == "settings_stats":
+        s = sb.get_stats()
+        text = (
+            "📊✨ *Statistik Bot* 💎\n\n"
+            "*Transaksi*\n"
+            f"💳 Total: *{s['total_tx']}*\n"
+            f"✅ Disetujui: *{s['approved_tx']}*\n"
+            f"❌ Ditolak: *{s['rejected_tx']}*\n"
+            f"⏳ Pending: *{s['pending_tx']}*\n"
+            f"🧾 Hari ini: *{s['tx_today']}*\n\n"
+            "*Revenue*\n"
+            f"💰 Total (approved): *Rp{s['total_revenue']:,}*\n".replace(",", ".") +
+            f"💵 Hari ini: *Rp{s['revenue_today']:,}*\n\n".replace(",", ".") +
+            "*Member & Paket*\n"
+            f"👑 Total pernah VIP: *{s['total_vip_ever']}*\n"
+            f"💎 VIP aktif sekarang: *{s['active_vip']}*\n"
+            f"🏷️ Paket aktif: *{s['total_packages']}*\n"
+            f"👤 Total user unik: *{s['total_unique_users']}*\n\n"
+            "*Keamanan*\n"
+            f"🚨 User dengan pelanggaran: *{s['users_with_strikes']}*\n"
+            f"⚠️ Total strike tercatat: *{s['total_strikes']}*"
+        )
+        await fade_transition(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+        return ConversationHandler.END
+
+    if data == "settings_export":
+        text, markup = export_panel_render()
+        await fade_transition(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return EXPORT_PANEL
+
+    if data == "settings_broadcast":
+        await fade_transition(
+            query,
+            "📢💎 *Broadcast Pesan*\n\n"
+            "Kirim pesan yang mau di-broadcast ke *semua user* yang pernah "
+            "bertransaksi/VIP (boleh teks biasa, atau foto + caption).\n\n"
+            "💎 Bold/italic dan emoji premium yang kamu pakai langsung di chat ini "
+            "akan ikut tampil ke user (tidak perlu isi ID emoji manual).",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_kb(),
+        )
+        return BROADCAST_WAIT
+
+    if data == "set_greeting":
+        current_photo = db.get_setting("greeting_photo_file_id", "")
+        await fade_transition(
+            query,
+            "Kirim teks sapaan baru, ATAU kirim FOTO (boleh dengan caption) untuk "
+            "menambahkan foto ke pesan sapaan.\n\n"
+            "📷 Kirim foto + caption -> teks sapaan ikut diganti jadi caption itu.\n"
+            "📷 Kirim foto TANPA caption -> foto ditambahkan, teks sapaan yang lama "
+            "tetap dipakai.\n"
+            "✏️ Kirim teks biasa (tanpa foto) -> hanya teks sapaan yang diganti, "
+            "foto yang sudah ada (kalau ada) tetap dipakai.\n"
+            "🗑️ Ketik <code>hapus foto</code> untuk menghapus foto sapaan (kembali "
+            "ke sapaan teks biasa).\n\n"
+            + ("💡 Saat ini pesan sapaan sudah pakai foto.\n\n" if current_photo else "")
+            + "💎 Mau pakai emoji premium? Tinggal sisipkan emoji premium-nya langsung "
+            "di teks yang kamu ketik/kirim di chat ini — tidak perlu cari/isi ID emoji "
+            "secara manual, bot otomatis mendeteksi & menyimpannya. Bold/italic/format "
+            "lain yang kamu pakai di chat juga ikut tersimpan.\n\n"
+            "🔢 Sisipkan <code>{vip_count}</code> di teks kalau mau menampilkan jumlah "
+            "member VIP (mis. \"Bergabung dengan {vip_count}+ Member VIP\").",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(),
+        )
+        return SET_GREETING
+
+    if data == "set_vip_text":
+        await fade_transition(
+            query,
+            "Kirim teks intro menu VIP baru.\n\n"
+            "💎 Sama seperti teks sapaan — emoji premium bisa langsung disisipkan di "
+            "chat, tidak perlu ID emoji manual.\n\n"
+            "🔢 Sisipkan <code>{vip_count}</code> di teks kalau mau menampilkan jumlah "
+            "member VIP.",
+            reply_markup=back_kb(),
+        )
+        return SET_VIP_TEXT
+
+    if data == "set_qris":
+        await fade_transition(query, "Kirim foto QRIS baru:", reply_markup=back_kb())
+        return SET_QRIS
+
+    if data == "set_qris_caption":
+        current = db.get_setting("qris_caption_text", db.DEFAULT_QRIS_CAPTION)
+        await fade_transition(
+            query,
+            "Kirim teks <b>pesan tampilan QRIS</b> yang baru (ini pesan yang muncul begitu user "
+            "memilih paket, bersama gambar QRIS).\n\n"
+            "Placeholder yang bisa dipakai (akan otomatis diganti nilai asli):\n"
+            "<code>{package}</code> nama paket, <code>{duration}</code> durasi (hari), "
+            "<code>{amount}</code> total transfer.\n\n"
+            "💎 Emoji premium & bold/italic yang kamu pakai langsung di chat ini ikut tersimpan.\n\n"
+            f"Teks saat ini:\n{current}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(),
+        )
+        return SET_QRIS_CAPTION
+
+    if data == "set_success_text":
+        current = db.get_setting("payment_success_text", db.DEFAULT_PAYMENT_SUCCESS)
+        await fade_transition(
+            query,
+            "Kirim teks <b>pesan pembayaran berhasil</b> yang baru (dikirim ke user saat "
+            "transaksi di-approve, baik otomatis maupun manual oleh admin).\n\n"
+            "Placeholder yang bisa dipakai:\n"
+            "<code>{package}</code> nama paket, <code>{duration}</code> durasi (hari), "
+            "<code>{amount}</code> nominal transfer, <code>{expiry}</code> tanggal VIP berakhir.\n\n"
+            "💎 Emoji premium & bold/italic yang kamu pakai langsung di chat ini ikut tersimpan.\n\n"
+            f"Teks saat ini:\n{current}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(),
+        )
+        return SET_SUCCESS_TEXT
+
+    if data == "set_reject_text":
+        current = db.get_setting("payment_reject_text", db.DEFAULT_PAYMENT_REJECT)
+        await fade_transition(
+            query,
+            "Kirim teks <b>pesan pembayaran ditolak/gagal</b> yang baru (dikirim ke user saat "
+            "transaksi di-reject, baik otomatis maupun manual oleh admin).\n\n"
+            "Placeholder yang bisa dipakai:\n"
+            "<code>{package}</code> nama paket, <code>{amount}</code> nominal yang diharapkan, "
+            "<code>{reason}</code> alasan penolakan.\n\n"
+            "💎 Emoji premium & bold/italic yang kamu pakai langsung di chat ini ikut tersimpan.\n\n"
+            f"Teks saat ini:\n{current}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(),
+        )
+        return SET_REJECT_TEXT
+
+    if data == "set_watermark":
+        wm_status = "✅ sudah diset" if os.path.exists(config.WATERMARK_IMAGE_PATH) else "⚠️ belum diset"
+        await fade_transition(
+            query,
+            "Kirim <b>stiker (sticker)</b> yang mau dipakai sebagai watermark testi.\n\n"
+            "Watermark ini akan ditempel <b>transparan, ukuran sedang, di tengah</b> setiap "
+            "bukti transfer yang diposting otomatis ke channel testi (channel testi diset lewat "
+            "env var <code>TESTI_CHANNEL_ID</code>).\n\n"
+            "⚠️ Kirim stiker <b>statis</b> (gambar diam), bukan stiker animasi/video.\n\n"
+            f"Status watermark saat ini: {wm_status}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(),
+        )
+        return SET_WATERMARK
+
+    if data == "set_testi_caption":
+        current = db.get_setting("testi_caption_text", db.DEFAULT_TESTI_CAPTION)
+        await fade_transition(
+            query,
+            "Kirim teks <b>caption testi</b> yang baru (dipakai saat bukti transfer yang "
+            "approved diposting otomatis ke channel testi).\n\n"
+            "Placeholder yang bisa dipakai:\n"
+            "<code>{package}</code> nama paket VIP yang dibeli.\n\n"
+            "💎 Emoji premium & bold/italic yang kamu pakai langsung di chat ini ikut tersimpan.\n\n"
+            f"Teks saat ini:\n{current}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(),
+        )
+        return SET_TESTI_CAPTION
+
+    if data == "set_static_link":
+        current = db.get_setting("static_access_link", "") or "(belum diset)"
+        await fade_transition(
+            query,
+            "Kirim <b>link akses statis GLOBAL</b> yang baru.\n\n"
+            "Link ini otomatis dipakai sebagai akses untuk <b>semua paket VIP</b> "
+            "yang tidak diset grup Telegram (Chat ID) dan tidak punya link khusus "
+            "sendiri — jadi cukup diisi <b>SEKALI di sini</b>, tidak perlu diulang "
+            "tiap tambah/edit paket.\n\n"
+            "Kirim '-' untuk mengosongkan.\n\n"
+            f"Link saat ini: {html.escape(current)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(),
+        )
+        return SET_STATIC_LINK
+
+    if data == "add_package":
+        context.user_data["new_pkg"] = {}
+        await fade_transition(
+            query, "Masukkan *nama paket* baru (contoh: VIP Bulanan):", parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb()
+        )
+        return ADD_PKG_NAME
+
+    if data == "edit_package":
+        await fade_transition(
+            query, "Pilih paket yang ingin diedit:", reply_markup=with_back(kb.package_pick_keyboard("editpkg"))
+        )
+        return EDIT_PKG_PICK
+
+    if data == "delete_package":
+        await fade_transition(
+            query, "Pilih paket yang ingin dihapus:", reply_markup=with_back(kb.package_pick_keyboard("delpkg"))
+        )
+        return ConversationHandler.END
+
+    if data.startswith("delpkg_"):
+        pkg_id = int(data.split("_")[1])
+        db.delete_package(pkg_id)
+        await fade_transition(query, "✅ Paket berhasil dihapus (dinonaktifkan).", reply_markup=settings_menu_kb())
+        return ConversationHandler.END
+
+    if data.startswith("editpkg_"):
+        pkg_id = int(data.split("_")[1])
+        context.user_data["edit_pkg_id"] = pkg_id
+        pkg = db.get_package(pkg_id)
+        await fade_transition(
+            query,
+            f"Paket saat ini: *{pkg['name']}*, harga Rp{pkg['price']:,}, durasi {pkg['duration_days']} hari.\n".replace(",", ".") +
+            "Masukkan *nama baru*:", parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb()
+        )
+        return EDIT_PKG_NAME
+
+    if data == "settings_promo":
+        text, markup = promo_menu_render()
+        await fade_transition(query, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return PROMO_MENU
+
+    if data == "manage_collective":
+        await fade_transition(
+            query,
+            "🔗📦 *Kelola Paket Kolektif*\n\n"
+            "Paket kolektif adalah paket VIP yang berisi *lebih dari 1 channel/grup* "
+            "sekaligus (contoh: \"Paket 16 Link\" berisi 16 channel VIP). Setiap channel "
+            "tetap dapat link akses 1x pakai (auto-expire) tersendiri saat pembeli checkout.\n\n"
+            "Pilih paket yang mau dikelola daftar link-nya:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=with_back(pkgcol_pick_kb()),
+        )
+        return PKG_COLLECTIVE_PICK
+
+    if data.startswith("pkgcol_pick_"):
+        pkg_id = int(data.split("_")[2])
+        context.user_data["pkgcol_id"] = pkg_id
+        text, markup = pkgcol_menu_render(pkg_id)
+        await fade_transition(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return PKG_COLLECTIVE_MENU
+
+    return ConversationHandler.END
+
+
+async def save_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
+    if message.photo:
+        # Foto sapaan baru. file_id-nya saja yang disimpan (bukan file lokal)
+        # -- Telegram mengizinkan file_id yang sama dipakai berulang kali untuk
+        # kirim ulang foto tanpa upload ulang, jadi cukup ringan disimpan di
+        # settings sebagai string biasa lewat db.set_setting().
+        photo_file_id = message.photo[-1].file_id
+        db.set_setting("greeting_photo_file_id", photo_file_id)
+
+        if message.caption:
+            # Foto dikirim SEKALIAN dengan caption -> caption itu jadi teks
+            # sapaan baru juga (format/emoji premium di caption ikut tersimpan,
+            # sama seperti alur teks biasa).
+            db.set_setting("greeting_text", html_of_caption(message))
+            confirm = (
+                "✅ Foto & teks sapaan berhasil diperbarui (caption dipakai sebagai "
+                "teks sapaan baru)."
+            )
+        else:
+            confirm = (
+                "✅ Foto sapaan berhasil ditambahkan. Teks sapaan yang sudah ada "
+                "tetap dipakai sebagai caption-nya."
+            )
+        await message.reply_text(confirm, reply_markup=settings_menu_kb())
+        return ConversationHandler.END
+
+    text = (message.text or "").strip()
+    if text.lower() in ("hapus foto", "hapus foto sapaan", "/hapus_foto"):
+        db.set_setting("greeting_photo_file_id", "")
+        await message.reply_text(
+            "✅ Foto sapaan dihapus. Sapaan kembali tampil sebagai teks biasa.",
+            reply_markup=settings_menu_kb(),
+        )
+        return ConversationHandler.END
+
+    db.set_setting("greeting_text", html_of_text(message))
+    await message.reply_text(
+        "✅ Teks sapaan berhasil diperbarui (emoji premium/format yang kamu pakai ikut tersimpan).",
+        reply_markup=settings_menu_kb(),
+    )
+    return ConversationHandler.END
+
+
+async def save_vip_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.set_setting("vip_menu_text", html_of_text(update.message))
+    await update.message.reply_text(
+        "✅ Teks menu VIP berhasil diperbarui (emoji premium/format yang kamu pakai ikut tersimpan).",
+        reply_markup=settings_menu_kb(),
+    )
+    return ConversationHandler.END
+
+
+async def save_qris_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.set_setting("qris_caption_text", html_of_text(update.message))
+    await update.message.reply_text(
+        "✅ Pesan tampilan QRIS berhasil diperbarui (emoji premium/format yang kamu pakai ikut tersimpan).",
+        reply_markup=settings_menu_kb(),
+    )
+    return ConversationHandler.END
+
+
+async def save_success_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.set_setting("payment_success_text", html_of_text(update.message))
+    await update.message.reply_text(
+        "✅ Pesan pembayaran berhasil berhasil diperbarui (emoji premium/format yang kamu pakai ikut tersimpan).",
+        reply_markup=settings_menu_kb(),
+    )
+    return ConversationHandler.END
+
+
+async def save_reject_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.set_setting("payment_reject_text", html_of_text(update.message))
+    await update.message.reply_text(
+        "✅ Pesan pembayaran ditolak berhasil diperbarui (emoji premium/format yang kamu pakai ikut tersimpan).",
+        reply_markup=settings_menu_kb(),
+    )
+    return ConversationHandler.END
+
+
+async def save_watermark(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sticker = update.message.sticker
+    if not sticker:
+        await update.message.reply_text(
+            "Mohon kirim dalam bentuk <b>stiker (sticker)</b>, bukan foto/dokumen biasa.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(),
+        )
+        return SET_WATERMARK
+    if sticker.is_animated or sticker.is_video:
+        await update.message.reply_text(
+            "Stiker animasi/video belum didukung untuk watermark. Mohon kirim stiker "
+            "<b>statis</b> (gambar diam) saja.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_kb(),
+        )
+        return SET_WATERMARK
+
+    file = await sticker.get_file()
+    raw_path = os.path.join(config.DATA_DIR, "watermark_raw.webp")
+    await file.download_to_drive(raw_path)
+
+    try:
+        img = Image.open(raw_path).convert("RGBA")
+        img.save(config.WATERMARK_IMAGE_PATH, "PNG")
+    except Exception as e:
+        logger.error(f"Gagal memproses stiker jadi watermark: {e}")
+        await update.message.reply_text(
+            "⚠️ Gagal memproses stiker itu jadi watermark. Coba kirim stiker statis lain.",
+            reply_markup=back_kb(),
+        )
+        return SET_WATERMARK
+    finally:
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+    await update.message.reply_text(
+        "✅ Watermark testi berhasil diperbarui. Mulai sekarang watermark ini otomatis "
+        "ditempel transparan di tengah tiap bukti transfer yang diposting ke channel testi.",
+        reply_markup=settings_menu_kb(),
+    )
+    return ConversationHandler.END
+
+
+async def save_testi_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.set_setting("testi_caption_text", html_of_text(update.message))
+    await update.message.reply_text(
+        "✅ Caption testi berhasil diperbarui (emoji premium/format yang kamu pakai ikut tersimpan).",
+        reply_markup=settings_menu_kb(),
+    )
+    return ConversationHandler.END
+
+
+async def save_static_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    link = "" if text == "-" else text
+    db.set_setting("static_access_link", link)
+    await update.message.reply_text(
+        "✅ Link akses statis global berhasil diperbarui. Link ini otomatis dipakai "
+        "untuk semua paket yang tidak punya grup Telegram / link khusus sendiri.",
+        reply_markup=settings_menu_kb(),
+    )
+    return ConversationHandler.END
+
+
+async def save_qris(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("Mohon kirim dalam bentuk foto.", reply_markup=back_kb())
+        return SET_QRIS
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    await file.download_to_drive(config.QRIS_IMAGE_PATH)
+
+    # Decode SEKALI di sini (bukan setiap kali ada pembelian) supaya QRIS
+    # dinamis per-transaksi bisa dibuat instan tanpa perlu baca ulang file
+    # gambar tiap kali user checkout -- lihat start_purchase_flow() &
+    # qris_dinamis.py untuk detail cara kerja konversi statis -> dinamisnya.
+    try:
+        static_qris_string = qris_dinamis.decode_qris_image(config.QRIS_IMAGE_PATH)
+        if not qris_dinamis.is_static_qris(static_qris_string):
+            db.set_setting("qris_static_string", "")
+            await update.message.reply_text(
+                "⚠️ QRIS berhasil disimpan sebagai gambar, TAPI kode QR ini "
+                "terdeteksi sudah DINAMIS (bukan QRIS statis biasa dari akun "
+                "DANA Bisnis kamu). Fitur nominal-otomatis TIDAK bisa dipakai "
+                "untuk QRIS jenis ini -- bot akan pakai cara lama (nominal "
+                "unik manual). Upload ulang dengan QRIS STATIS kalau mau "
+                "fitur nominal-otomatis aktif.",
+                reply_markup=settings_menu_kb(),
+            )
+            return ConversationHandler.END
+        db.set_setting("qris_static_string", static_qris_string)
+        await update.message.reply_text(
+            "✅ QRIS berhasil diperbarui. Nominal-otomatis AKTIF -- user akan "
+            "menerima QR dengan nominal sudah terisi otomatis, tinggal scan & bayar.",
+            reply_markup=settings_menu_kb(),
+        )
+    except qris_dinamis.QRISDecodeError as e:
+        # Tetap simpan gambarnya (supaya bot tidak "kosong QRIS-nya"), tapi
+        # nonaktifkan mode nominal-otomatis & jelaskan alasannya ke admin.
+        db.set_setting("qris_static_string", "")
+        await update.message.reply_text(
+            f"⚠️ QRIS berhasil disimpan sebagai gambar, TAPI kode QR-nya gagal "
+            f"dibaca ({e}). Fitur nominal-otomatis TIDAK aktif untuk gambar "
+            f"ini -- bot akan pakai cara lama (nominal unik manual) sampai "
+            f"kamu upload ulang foto QRIS yang lebih jelas.",
+            reply_markup=settings_menu_kb(),
+        )
+    return ConversationHandler.END
+
+
+async def add_pkg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_pkg"]["name"] = update.message.text
+    await update.message.reply_text("Masukkan *harga* (angka saja, contoh: 50000):", parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    return ADD_PKG_PRICE
+
+
+async def add_pkg_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.text.isdigit():
+        await update.message.reply_text("Harga harus berupa angka. Coba lagi:", reply_markup=back_kb())
+        return ADD_PKG_PRICE
+    context.user_data["new_pkg"]["price"] = int(update.message.text)
+    await update.message.reply_text("Masukkan *durasi VIP* dalam hari (contoh: 30):", parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    return ADD_PKG_DURATION
+
+
+async def add_pkg_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.text.isdigit():
+        await update.message.reply_text("Durasi harus berupa angka. Coba lagi:", reply_markup=back_kb())
+        return ADD_PKG_DURATION
+    context.user_data["new_pkg"]["duration_days"] = int(update.message.text)
+    await update.message.reply_text(
+        "Masukkan *deskripsi singkat* paket (atau kirim '-' untuk kosongkan):",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb()
+    )
+    return ADD_PKG_DESC
+
+
+async def add_pkg_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    desc = "" if update.message.text.strip() == "-" else update.message.text
+    context.user_data["new_pkg"]["description"] = desc
+    await update.message.reply_text(
+        "Masukkan *Chat ID grup/channel Telegram VIP* untuk paket ini.\n"
+        "⚠️ Bot HARUS sudah jadi admin di grup/channel tsb dengan izin *Invite Users via Link*, "
+        "supaya bot bisa otomatis membuat link akses 1x pakai untuk tiap pembeli.\n\n"
+        "_Cara cek Chat ID: tambahkan @userinfobot ke grup/channel itu, atau forward salah satu "
+        "pesan dari grup itu ke @userinfobot._\n\n"
+        "Kirim '-' kalau paket ini tidak pakai grup Telegram — paket akan otomatis memakai "
+        "*link akses statis global* yang sudah kamu set lewat menu \"🔗 Atur Link Akses Statis "
+        "(Global)\" (tidak perlu diinput lagi di sini):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_kb(),
+    )
+    return ADD_PKG_CHATID
+
+
+async def add_pkg_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    p = context.user_data["new_pkg"]
+    p["target_chat_id"] = "" if text == "-" else text
+    db.add_package(p["name"], p["price"], p["duration_days"], p["description"], "", p.get("target_chat_id", ""))
+    await update.message.reply_text("✅ Paket VIP baru berhasil ditambahkan.", reply_markup=settings_menu_kb())
+    context.user_data.pop("new_pkg", None)
+    return ConversationHandler.END
+
+
+async def edit_pkg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["edit_pkg_name"] = update.message.text
+    await update.message.reply_text("Masukkan *harga baru*:", parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    return EDIT_PKG_PRICE
+
+
+async def edit_pkg_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.text.isdigit():
+        await update.message.reply_text("Harga harus angka. Coba lagi:", reply_markup=back_kb())
+        return EDIT_PKG_PRICE
+    context.user_data["edit_pkg_price"] = int(update.message.text)
+    await update.message.reply_text("Masukkan *durasi baru* (hari):", parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
+    return EDIT_PKG_DURATION
+
+
+async def edit_pkg_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.text.isdigit():
+        await update.message.reply_text("Durasi harus angka. Coba lagi:", reply_markup=back_kb())
+        return EDIT_PKG_DURATION
+    context.user_data["edit_pkg_duration"] = int(update.message.text)
+    pkg = db.get_package(context.user_data["edit_pkg_id"])
+    current_chatid = pkg["target_chat_id"] or "(belum ada)"
+    await update.message.reply_text(
+        f"Chat ID grup VIP saat ini: {current_chatid}\n"
+        "Masukkan *Chat ID baru* (bot harus jadi admin di sana), kirim '-' untuk mengosongkan "
+        "(paket akan otomatis memakai *link akses statis global* dari menu \"🔗 Atur Link Akses "
+        "Statis (Global)\"), atau kirim '=' untuk membiarkan tetap sama:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_kb(),
+    )
+    return EDIT_PKG_CHATID
+
+
+async def edit_pkg_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "=":
+        chatid = None  # pertahankan nilai lama
+    elif text == "-":
+        chatid = ""
+    else:
+        chatid = text
+
+    db.edit_package(
+        context.user_data["edit_pkg_id"],
+        context.user_data["edit_pkg_name"],
+        context.user_data["edit_pkg_price"],
+        context.user_data["edit_pkg_duration"],
+        link=None,  # pertahankan link khusus paket (kalau ada) apa adanya
+        target_chat_id=chatid,
+    )
+    await update.message.reply_text("✅ Paket berhasil diperbarui.", reply_markup=settings_menu_kb())
+    for k in ("edit_pkg_id", "edit_pkg_name", "edit_pkg_price", "edit_pkg_duration"):
+        context.user_data.pop(k, None)
+    return ConversationHandler.END
+
+
+def pkgcol_pick_kb() -> InlineKeyboardMarkup:
+    """Daftar semua paket VIP (termasuk yang nonaktif, biar tetap bisa dikelola
+    link-nya) untuk dipilih di menu Kelola Paket Kolektif. Dibuat manual (tidak
+    lewat keyboards.py) karena prefix callback-nya (pkgcol_pick_) khusus untuk
+    fitur ini saja."""
+    rows = []
+    for pkg in db.list_packages(active_only=False):
+        n = db.count_package_channels(pkg["id"])
+        label = pkg["name"] + (f" ({n} link)" if n else "")
+        rows.append([make_button(label, callback_data=f"pkgcol_pick_{pkg['id']}")])
+    if not rows:
+        rows.append([make_button("(belum ada paket)", callback_data="settings_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def pkgcol_menu_render(pkg_id: int):
+    """Teks + 3 tombol pengaturan (➕ Tambah / 📋 Lihat / 🗑️ Hapus Link) untuk
+    satu paket kolektif tertentu."""
+    pkg = db.get_package(pkg_id)
+    n = db.count_package_channels(pkg_id)
+    text = (
+        f"🔗📦 *{pkg['name']}*\n"
+        f"Jumlah link terpasang: *{n}*\n\n"
+        "Setiap link yang ditambahkan di sini akan dikirim 1x-pakai (auto-expire) "
+        "tersendiri ke pembeli, sama seperti paket biasa -- bedanya pembeli dapat "
+        f"*semua {n or 'N'} link sekaligus* dalam satu pesan.\n\n"
+        "Pilih aksi:"
+    )
+    markup = InlineKeyboardMarkup([
+        [make_button("➕ Tambah Link", callback_data=f"pkgcol_add_{pkg_id}", style="success")],
+        [make_button("📋 Lihat Daftar Link", callback_data=f"pkgcol_list_{pkg_id}", style="primary")],
+        [make_button("🗑️ Hapus Link", callback_data=f"pkgcol_del_{pkg_id}", style="danger")],
+        [make_button("⬅️ Kembali", callback_data="manage_collective")],
+    ])
+    return text, markup
+
+
+async def pkgcol_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler 3 tombol pengaturan paket kolektif (Tambah/Lihat/Hapus Link) +
+    sub-aksi hapus per-link/hapus semua. Dipisah dari settings_router supaya
+    fungsi itu tidak makin panjang."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Khusus admin.", show_alert=True)
+        return ConversationHandler.END
+
+    data = query.data
+
+    if data.startswith("pkgcol_add_"):
+        pkg_id = int(data.split("_")[2])
+        context.user_data["pkgcol_id"] = pkg_id
+        await fade_transition(
+            query,
+            "➕ *Tambah Link ke Paket Kolektif*\n\n"
+            "Kirim *Chat ID* channel/grup VIP yang mau ditambahkan (bot HARUS sudah "
+            "jadi admin di sana dengan izin *Invite Users via Link*).\n\n"
+            "Mau tambah banyak sekaligus (mis. semua 16 channel \"Paket 16 Link\")? "
+            "Kirim *1 Chat ID per baris*, boleh sertakan label opsional setelah spasi:\n"
+            "`-1001111111111 Link 1`\n"
+            "`-1001222222222 Link 2`\n"
+            "`-1001333333333`\n\n"
+            "_Cara cek Chat ID: forward salah satu pesan dari channel itu ke @userinfobot._\n\n"
+            "Kirim '-' untuk batal.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_kb(),
+        )
+        return PKG_COLLECTIVE_ADD_WAIT
+
+    if data.startswith("pkgcol_list_"):
+        pkg_id = int(data.split("_")[2])
+        pkg = db.get_package(pkg_id)
+        channels = db.list_package_channels(pkg_id)
+        if not channels:
+            body = "_(belum ada link yang ditambahkan)_"
+        else:
+            lines = []
+            for i, ch in enumerate(channels, start=1):
+                lbl = f" — {html.escape(ch['label'])}" if ch["label"] else ""
+                lines.append(f"{i}. `{ch['chat_id']}`{lbl}")
+            body = "\n".join(lines)
+        text = f"📋 *Daftar Link — {pkg['name']}*\n\n{body}"
+        _, markup = pkgcol_menu_render(pkg_id)
+        await fade_transition(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return PKG_COLLECTIVE_MENU
+
+    if data.startswith("pkgcol_delone_"):
+        parts = data.split("_")
+        channel_row_id, pkg_id = int(parts[2]), int(parts[3])
+        db.delete_package_channel(channel_row_id)
+        await query.answer("✅ Link dihapus.")
+        text, markup = pkgcol_menu_render(pkg_id)
+        await fade_transition(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return PKG_COLLECTIVE_MENU
+
+    if data.startswith("pkgcol_delall_"):
+        pkg_id = int(data.split("_")[2])
+        n = db.clear_package_channels(pkg_id)
+        await query.answer(f"✅ {n} link dihapus.")
+        text, markup = pkgcol_menu_render(pkg_id)
+        await fade_transition(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return PKG_COLLECTIVE_MENU
+
+    if data.startswith("pkgcol_del_"):
+        pkg_id = int(data.split("_")[2])
+        channels = db.list_package_channels(pkg_id)
+        if not channels:
+            await query.answer("Belum ada link untuk dihapus.", show_alert=True)
+            text, markup = pkgcol_menu_render(pkg_id)
+            await fade_transition(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+            return PKG_COLLECTIVE_MENU
+        rows = [
+            [make_button(f"🗑️ {ch['label'] or ch['chat_id']}", callback_data=f"pkgcol_delone_{ch['id']}_{pkg_id}")]
+            for ch in channels
+        ]
+        rows.append([make_button("🗑️ Hapus SEMUA Link Paket Ini", callback_data=f"pkgcol_delall_{pkg_id}", style="danger")])
+        rows.append([make_button("⬅️ Kembali", callback_data=f"pkgcol_pick_{pkg_id}")])
+        await fade_transition(query, "Pilih link yang mau dihapus:", reply_markup=InlineKeyboardMarkup(rows))
+        return PKG_COLLECTIVE_MENU
+
+    return PKG_COLLECTIVE_MENU
+
+
+async def pkgcol_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Terima teks Chat ID (boleh banyak baris sekaligus) dan simpan sebagai
+    channel-channel milik paket kolektif yang sedang dikelola."""
+    pkg_id = context.user_data.get("pkgcol_id")
+    if not pkg_id:
+        await update.message.reply_text("Sesi kadaluwarsa, silakan buka menu lagi.", reply_markup=settings_menu_kb())
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if text == "-":
+        body_text, markup = pkgcol_menu_render(pkg_id)
+        await update.message.reply_text(body_text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+        return PKG_COLLECTIVE_MENU
+
+    added, skipped = 0, 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=1)
+        chat_id_str = parts[0]
+        label = parts[1] if len(parts) > 1 else ""
+        # Chat ID Telegram grup/channel selalu angka (boleh diawali minus) --
+        # baris yang bukan angka dilewati supaya tidak menyimpan sampah.
+        if not chat_id_str.lstrip("-").isdigit():
+            skipped += 1
+            continue
+        db.add_package_channel(pkg_id, chat_id_str, label)
+        added += 1
+
+    summary = f"✅ *{added}* link ditambahkan."
+    if skipped:
+        summary += f" ⚠️ *{skipped}* baris dilewati (bukan Chat ID valid)."
+    body_text, markup = pkgcol_menu_render(pkg_id)
+    await update.message.reply_text(f"{summary}\n\n{body_text}", parse_mode=ParseMode.MARKDOWN, reply_markup=markup)
+    return PKG_COLLECTIVE_MENU
+
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk /cancel & /batal -- menghentikan paksa alur /settings
+    yang sedang berjalan (di state manapun), apa pun yang sedang ditunggu
+    bot dari admin saat itu (teks, foto, atau stiker)."""
+    await update.message.reply_text(
+        "🛑 Perintah /settings dibatalkan. Semua proses yang belum selesai di alur itu dihentikan.",
+        reply_markup=kb.main_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ── 📢 Broadcast ─────────────────────────────────────────────────────────
+
+async def broadcast_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Terima konten broadcast dari admin (teks atau foto+caption), simpan
+    sementara, lalu tampilkan preview + tombol konfirmasi kirim/batal."""
+    msg = update.message
+    if msg.photo:
+        caption_html = apply_premium_emoji_html(html_of_caption(msg))
+        payload = {"type": "photo", "file_id": msg.photo[-1].file_id, "caption": caption_html}
+        preview_prefix = "🖼️ <b>Preview foto broadcast:</b>\n"
+    else:
+        if not msg.text:
+            await update.message.reply_text("Kirim teks atau foto ya. Coba lagi:", reply_markup=back_kb())
+            return BROADCAST_WAIT
+        text_html = apply_premium_emoji_html(html_of_text(msg))
+        payload = {"type": "text", "text": text_html}
+        preview_prefix = "📝 <b>Preview pesan broadcast:</b>\n"
+
+    # Emoji premium bisa "masuk" dari 2 sumber: (1) admin PUNYA Telegram
+    # Premium & menempel emoji custom langsung (sudah tertangkap otomatis
+    # lewat html_of_text/html_of_caption di atas), atau (2) apply_premium_emoji_html()
+    # baru saja mengganti emoji unicode pemicu jadi <tg-emoji>. Keduanya sama-sama
+    # menghasilkan tag "<tg-emoji" di HTML-nya, jadi cukup dihitung sekali di sini.
+    body = payload.get("caption") or payload.get("text") or ""
+    emoji_count = body.count("<tg-emoji")
+    premium_note = f"✨ <i>{emoji_count} emoji premium terdeteksi, akan ikut terkirim.</i>\n" if emoji_count else ""
+
+    context.user_data["broadcast_payload"] = payload
+    is_recurring = context.user_data.get("broadcast_mode") == "recurring"
+
+    if is_recurring:
+        confirm_kb = InlineKeyboardMarkup([
+            [make_button("💾 Simpan sebagai Pesan Berulang", callback_data="broadcast_send", style="success")],
+            [make_button("🔙 Batal", callback_data="broadcast_cancel", style="danger")],
+        ])
+        mode_note = "🔁 <i>Ini akan disimpan sebagai template broadcast BERULANG, bukan dikirim sekarang.</i>\n"
+    else:
+        target_count = len(sb.get_broadcast_user_ids())
+        confirm_kb = InlineKeyboardMarkup([
+            [make_button(f"✅💎 Kirim ke {target_count} user", callback_data="broadcast_send", style="success")],
+            [make_button("🔙 Batal", callback_data="broadcast_cancel", style="danger")],
+        ])
+        mode_note = ""
+
+    if payload["type"] == "photo":
+        await update.message.reply_photo(
+            photo=payload["file_id"],
+            caption=preview_prefix + mode_note + premium_note + (payload["caption"] or "<i>(tanpa caption)</i>"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=confirm_kb,
+        )
+    else:
+        await update.message.reply_text(
+            preview_prefix + mode_note + premium_note + payload["text"], parse_mode=ParseMode.HTML, reply_markup=confirm_kb
+        )
+    return BROADCAST_CONFIRM
+
+
+async def _edit_broadcast_status(query, text: str):
+    """Update pesan preview broadcast (bisa berupa pesan TEKS biasa atau
+    FOTO+caption) jadi status baru dengan aman.
+
+    Bug sebelumnya: broadcast_confirm() selalu memakai query.edit_message_text()
+    apa pun tipe pesan preview-nya. Itu valid untuk broadcast teks, TAPI kalau
+    admin mem-broadcast FOTO, preview-nya dikirim lewat reply_photo() (pesan
+    media+caption) -- dan Telegram MENOLAK editMessageText untuk pesan media
+    (wajib editMessageCaption). Begitu admin menekan "Kirim", baris itu
+    langsung melempar BadRequest SEBELUM satu pun pesan sempat terkirim ke
+    user manapun -- persis terasa seperti "tombol Kirim error, broadcast
+    gagal total". Helper ini memilih method yang benar berdasar tipe pesan
+    preview-nya, dan SENGAJA tidak pernah melempar exception ke pemanggil --
+    update status ini cuma kosmetik; kalaupun gagal (mis. rate-limit atau
+    kondisi tak terduga lain), broadcast yang sesungguhnya (loop kirim ke
+    tiap user) tetap harus lanjut jalan."""
+    try:
+        if query.message.photo:
+            await query.edit_message_caption(caption=text)
+        else:
+            await query.edit_message_text(text)
+    except Exception as e:
+        logger.warning(f"Gagal update status pesan preview broadcast: {e}")
+
+
+async def send_broadcast_payload(context: ContextTypes.DEFAULT_TYPE, payload: dict):
+    """Kirim satu payload broadcast (teks atau foto+caption, lihat struktur
+    di broadcast_receive()) ke SEMUA user target. Dipakai baik oleh broadcast
+    manual (broadcast_confirm) maupun broadcast BERULANG otomatis
+    (job_auto_broadcast_tick) -- satu logika pengiriman, dua pemicu."""
+    user_ids = sb.get_broadcast_user_ids()
+    success, failed = 0, 0
+    for uid in user_ids:
+        try:
+            if payload["type"] == "photo":
+                await context.bot.send_photo(
+                    uid, photo=payload["file_id"], caption=payload.get("caption") or None, parse_mode=ParseMode.HTML
+                )
+            else:
+                await context.bot.send_message(uid, payload["text"], parse_mode=ParseMode.HTML)
+            success += 1
+        except Exception as e:
+            failed += 1
+            logger.warning(f"Broadcast gagal terkirim ke user {uid}: {e}")
+        await asyncio.sleep(0.05)  # jaga rate limit Telegram (~20-30 pesan/detik ke chat berbeda)
+    return success, failed, len(user_ids)
+
+
+async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.answer("Khusus admin.", show_alert=True)
+        return ConversationHandler.END
+
+    is_recurring = context.user_data.get("broadcast_mode") == "recurring"
+
+    if query.data == "broadcast_cancel":
+        context.user_data.pop("broadcast_payload", None)
+        context.user_data.pop("broadcast_mode", None)
+        await _edit_broadcast_status(query, "Broadcast dibatalkan.")
+        await context.bot.send_message(
+            query.from_user.id, "⚙️✨ *Menu Pengaturan Bot*", parse_mode=ParseMode.MARKDOWN, reply_markup=settings_menu_kb()
+        )
+        return ConversationHandler.END
+
+    payload = context.user_data.get("broadcast_payload")
+    if not payload:
+        await _edit_broadcast_status(query, "Sesi broadcast kedaluwarsa, silakan ulangi.")
+        return ConversationHandler.END
+
+    # ── Mode BERULANG: simpan sebagai template, TIDAK langsung dikirim ──
+    if is_recurring:
+        db.set_setting("recurring_broadcast_payload", json.dumps(payload))
+        context.user_data.pop("broadcast_payload", None)
+        context.user_data.pop("broadcast_mode", None)
+        enabled = db.get_setting("recurring_broadcast_enabled", "0") == "1"
+        interval_hours = db.get_setting("recurring_broadcast_interval_hours", "24")
+        await _edit_broadcast_status(
+            query,
+            "💾 Pesan berulang berhasil disimpan.\n\n"
+            f"Status saat ini: {'✅ Aktif' if enabled else '❌ Nonaktif -- aktifkan dengan /autobroadcast on'}\n"
+            f"⏱ Interval: setiap {interval_hours} jam (ubah dengan /autobroadcast interval <jam>)",
+        )
+        return ConversationHandler.END
+
+    # ── Mode biasa: kirim SEKARANG ke semua user ──
+    await _edit_broadcast_status(query, "📤 Mengirim broadcast, mohon tunggu...")
+
+    success, failed, total = await send_broadcast_payload(context, payload)
+
+    report = (
+        f"📢✅ *Broadcast selesai*\n\n"
+        f"Berhasil: *{success}*\n"
+        f"Gagal: *{failed}*\n"
+        f"Total target: *{total}*"
+    )
+    await context.bot.send_message(query.from_user.id, report, parse_mode=ParseMode.MARKDOWN, reply_markup=settings_menu_kb())
+    if config.LOG_CHAT_ID:
+        await context.bot.send_message(config.LOG_CHAT_ID, report, parse_mode=ParseMode.MARKDOWN)
+
+    context.user_data.pop("broadcast_payload", None)
+    return ConversationHandler.END
+
+
+def _escape_md(text: str) -> str:
+    """Escape karakter spesial Markdown (legacy, ParseMode.MARKDOWN) supaya
+    teks DINAMIS -- nama fungsi Python, pesan exception, dll -- aman
+    disisipkan ke pesan Markdown tanpa bikin Telegram menolak pesan.
+
+    SEBELUM INI TIDAK ADA fungsi escape sama sekali dipakai untuk teks
+    dinamis semacam ini. Contoh nyata yang pernah kejadian: nama fungsi
+    seperti "import_packages" punya SATU underscore -- oleh parser
+    Markdown legacy Telegram itu dibaca sebagai pembuka *italic* yang
+    tidak pernah ditutup, sehingga Telegram menolak kirim pesan dengan
+    error "Can't parse entities". Error itu terjadi SETELAH restore
+    selesai, di dalam handler restoredb_confirm_cb, dan tidak tertangkap
+    di sana -- jadi menyebar ke error_handler global dan user cuma lihat
+    pesan generik "Terjadi kesalahan..." padahal proses restore-nya
+    sendiri sudah selesai (lihat catatan di restoredb_confirm_cb)."""
+    if text is None:
+        return ""
+    text = str(text)
+    for ch in ("\\", "_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler -- SEBELUM ini ditambahkan, exception apa pun yang
+    terjadi di dalam handler (mis. handle_webapp_data) hanya tercatat diam-diam
+    di log PTB internal, TANPA pemberitahuan apapun ke user (persis gejala
+    'tekan tombol Pilih di Mini App, tidak ada respon apapun'). Sekarang:
+    1. Traceback LENGKAP selalu dicetak ke log (mudah dicari, ada prefix jelas).
+    2. Kalau ada chat yang jelas terkait (update berupa Update object dengan
+       effective_chat), user dikirimi pesan singkat supaya tahu ada yang gagal
+       -- bukan cuma diam tanpa respon seolah bot tidak berfungsi."""
+    logger.error("Unhandled exception saat memproses update:", exc_info=context.error)
+
+    chat_id = None
+    if isinstance(update, Update):
+        if update.effective_chat:
+            chat_id = update.effective_chat.id
+        elif update.callback_query and update.callback_query.from_user:
+            # Callback query dari pesan inline (mis. hasil answerWebAppQuery,
+            # lihat catatan di main_menu_callback::buy_) tidak punya
+            # effective_chat -- fallback ke from_user.id, aman karena semua
+            # alur Mini App bot ini selalu terjadi di private chat 1-on-1.
+            chat_id = update.callback_query.from_user.id
+
+    if chat_id is not None:
+        try:
+            await context.bot.send_message(
+                chat_id,
+                "⚠️ Terjadi kesalahan saat memproses permintaanmu. Coba lagi, atau hubungi admin kalau berulang.",
+            )
+        except Exception:
+            pass  # kalau bahkan kirim pesan error ini gagal, jangan sampai bikin exception baru
+
+
+async def on_startup(app_: Application):
+    """post_init: jalan SEKALI setelah bot siap tapi sebelum polling mulai.
+    Kalau admin sudah setup WEBAPP_URL, nyalakan server API kecil (lihat
+    api_server.py) di event loop yang SAMA -- supaya cuma perlu 1 proses/
+    service di Railway, bukan 2."""
+    if config.WEBAPP_URL:
+        await api_server.start_api_server(config.PORT)
+    else:
+        logger.info("WEBAPP_URL belum diisi -> Mini App 'Lihat Paket VIP' nonaktif, fallback ke tabel teks di chat.")
+
+
+def main():
+    # Aktifkan animasi "sedang mengetik/mengirim..." di SETIAP chat bubble
+    # (pesan baru maupun edit pesan) -- mirip animasi proses AI sebelum
+    # jawabannya muncul. Cukup dipanggil sekali di sini, otomatis berlaku
+    # untuk semua reply_text / context.bot.send_* / edit_message_* di bot ini.
+    typing_animation.enable()
+
+    db.init_db()
+    # connect_timeout dinaikkan (default PTB cukup ketat, ~5 detik) supaya tidak
+    # gampang TimedOut saat container baru cold-start dan jaringannya belum "panas"
+    # (umum terjadi di awal deploy Railway). Kalau tetap gagal di percobaan pertama,
+    # restart policy Railway (lihat railway.json) akan tetap jadi jaring pengaman.
+    request = HTTPXRequest(
+        connect_timeout=20.0,
+        read_timeout=20.0,
+        write_timeout=20.0,
+        pool_timeout=20.0,
+    )
+    app = Application.builder().token(config.BOT_TOKEN).request(request).post_init(on_startup).build()
+    app.add_error_handler(error_handler)
+
+    # Pasang wrapper "chat bersih" di bot.send_message/send_photo, dan
+    # daftarkan pelacak pesan masuk di group=-1 (paling pertama dijalankan
+    # untuk tiap update, sebelum handler lain memprosesnya) -- lihat blok
+    # penjelasan lengkap di dekat definisi logger di atas.
+    install_chat_cleaner(app.bot)
+    app.add_handler(MessageHandler(filters.ALL & filters.ChatType.PRIVATE, track_incoming_message), group=-1)
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
+    app.add_handler(CallbackQueryHandler(
+        main_menu_callback, pattern="^(show_vip|back_main|my_status|how_to_order)$"
+    ))
+    app.add_handler(CallbackQueryHandler(admin_manual_decision, pattern="^admin_(approve|reject)_\\d+$"))
+
+    # Tombol "🎁 Klaim Kode Promo" di postingan channel promo -- GLOBAL (bukan
+    # bagian dari settings_conv), karena siapa saja (bukan cuma admin) boleh
+    # memencetnya. Lihat catatan lengkap di promo_claim_callback().
+    app.add_handler(CallbackQueryHandler(promo_claim_callback, pattern="^promo_claim$"))
+
+    # Alur beli paket + langkah opsional input kode promo -- dipisah dari
+    # main_menu_callback jadi ConversationHandler tersendiri (lihat buy_start()
+    # & catatan panjang di dekat start_purchase_flow()) supaya bisa menyisipkan
+    # 1 langkah "mau pakai kode promo?" sebelum QRIS dikirim, tanpa mengganggu
+    # callback lain (show_vip/back_main/dst) yang tetap ditangani main_menu_callback.
+    promo_purchase_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(buy_start, pattern="^buy_\\d+$")],
+        states={
+            PROMO_CHOICE: [
+                CallbackQueryHandler(promo_purchase_enter, pattern="^promo_enter_\\d+$"),
+                CallbackQueryHandler(promo_purchase_skip, pattern="^promo_skip_\\d+$"),
+            ],
+            PROMO_INPUT_WAIT: [
+                CallbackQueryHandler(promo_purchase_skip, pattern="^promo_skip_\\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_code_receive),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_conv),
+            CommandHandler("batal", cancel_conv),
+        ],
+    )
+    app.add_handler(promo_purchase_conv)
+
+    settings_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("settings", settings_cmd),
+            # Pintasan langsung ke alur broadcast, tanpa perlu buka /settings
+            # dulu -- lihat broadcast_cmd() untuk detail.
+            CommandHandler("broadcast", broadcast_cmd),
+            # /autobroadcast setmessage juga bisa masuk ke BROADCAST_WAIT (lihat
+            # cmd_autobroadcast) -- subcommand lain (on/off/interval/now/status)
+            # langsung END, tidak masuk state apa pun.
+            CommandHandler("autobroadcast", cmd_autobroadcast),
+            CallbackQueryHandler(settings_router, pattern="^(set_greeting|set_vip_text|set_qris|set_qris_caption|set_success_text|set_reject_text|set_watermark|set_testi_caption|set_static_link|add_package|edit_package|delete_package|delpkg_\\d+|editpkg_\\d+|settings_back|settings_close|settings_stats|settings_broadcast|settings_export|manage_collective|settings_promo)$"),
+            # Tombol "Kembali/Batal" (settings_cancel) juga didaftarkan sebagai entry
+            # point, bukan cuma di dalam states={...} di bawah. Alasannya: beberapa
+            # layar (mis. Statistik, atau daftar paket saat "Hapus Paket") sengaja
+            # meng-END-kan ConversationHandler begitu ditampilkan (karena tidak perlu
+            # melacak state lanjutan), tapi tombol "Kembali ke Menu Settings" di
+            # layar itu tetap memakai callback_data="settings_cancel". Tanpa entry
+            # point ini, begitu ConversationHandler sudah END, klik tombol itu tidak
+            # tertangkap oleh state manapun -> tombol terlihat "tidak berfungsi".
+            # Dengan didaftarkan di sini, tombol itu SELALU tertangkap, baik saat
+            # masih di tengah state manapun, maupun setelah conversation berakhir.
+            CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+        ],
+        states={
+            SET_GREETING: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO, save_greeting),
+            ],
+            SET_VIP_TEXT: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_vip_text),
+            ],
+            SET_QRIS: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.PHOTO, save_qris),
+            ],
+            SET_QRIS_CAPTION: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_qris_caption),
+            ],
+            SET_SUCCESS_TEXT: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_success_text),
+            ],
+            SET_REJECT_TEXT: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_reject_text),
+            ],
+            SET_WATERMARK: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.Sticker.ALL, save_watermark),
+            ],
+            SET_TESTI_CAPTION: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_testi_caption),
+            ],
+            SET_STATIC_LINK: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_static_link),
+            ],
+            ADD_PKG_NAME: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_pkg_name),
+            ],
+            ADD_PKG_PRICE: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_pkg_price),
+            ],
+            ADD_PKG_DURATION: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_pkg_duration),
+            ],
+            ADD_PKG_DESC: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_pkg_desc),
+            ],
+            ADD_PKG_CHATID: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_pkg_chatid),
+            ],
+            EDIT_PKG_PICK: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                CallbackQueryHandler(settings_router, pattern="^editpkg_\\d+$"),
+            ],
+            EDIT_PKG_NAME: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_pkg_name),
+            ],
+            EDIT_PKG_PRICE: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_pkg_price),
+            ],
+            EDIT_PKG_DURATION: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_pkg_duration),
+            ],
+            EDIT_PKG_CHATID: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_pkg_chatid),
+            ],
+            BROADCAST_WAIT: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, broadcast_receive),
+            ],
+            BROADCAST_CONFIRM: [
+                CallbackQueryHandler(broadcast_confirm, pattern="^(broadcast_send|broadcast_cancel)$"),
+            ],
+            EXPORT_PANEL: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                CallbackQueryHandler(export_panel_router, pattern="^(export_toggle|export_set_chat|export_set_interval|export_now)$"),
+            ],
+            EXPORT_SET_CHAT: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler((filters.TEXT | filters.FORWARDED) & ~filters.COMMAND, export_save_chat),
+            ],
+            EXPORT_SET_INTERVAL: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, export_save_interval),
+            ],
+            PKG_COLLECTIVE_PICK: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                CallbackQueryHandler(settings_router, pattern="^pkgcol_pick_\\d+$"),
+            ],
+            PKG_COLLECTIVE_MENU: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                CallbackQueryHandler(settings_router, pattern="^(manage_collective|pkgcol_pick_\\d+)$"),
+                CallbackQueryHandler(pkgcol_router, pattern="^pkgcol_(add|list|del|delone|delall)_\\d+(_\\d+)?$"),
+            ],
+            PKG_COLLECTIVE_ADD_WAIT: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pkgcol_add_receive),
+            ],
+            # ── 🎟️ Kode Promo (admin) ──────────────────────────────────────
+            PROMO_MENU: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                CallbackQueryHandler(
+                    promo_admin_router,
+                    pattern="^promo_(toggle_enabled|toggle_broadcast|regenerate|set_channel|set_post_channel|set_discount|set_maxuses|set_rotate|set_broadcast_hour|set_post_text|set_broadcast_text)$",
+                ),
+            ],
+            PROMO_SET_CHANNEL: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_field_receive),
+            ],
+            PROMO_SET_POST_CHANNEL: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_field_receive),
+            ],
+            PROMO_SET_DISCOUNT: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_field_receive),
+            ],
+            PROMO_SET_MAXUSES: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_field_receive),
+            ],
+            PROMO_SET_ROTATE_DAYS: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_field_receive),
+            ],
+            PROMO_SET_BROADCAST_HOUR: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_field_receive),
+            ],
+            PROMO_SET_POST_TEXT: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_field_receive),
+            ],
+            PROMO_SET_BROADCAST_TEXT: [
+                CallbackQueryHandler(settings_cancel, pattern="^settings_cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_set_field_receive),
+            ],
+        },
+        # "cancel" (Inggris) & "batal" (Indonesia) SENGAJA keduanya didaftarkan
+        # sebagai fallback -- supaya admin bisa mengetik salah satu untuk
+        # keluar/menghentikan alur /settings kapan pun, di state manapun,
+        # termasuk kalau macet/stuck menunggu input yang tidak kunjung sesuai
+        # (mis. salah kirim tipe pesan) dan tombol "Kembali/Batal" di layar
+        # entah kenapa tidak bisa dipencet.
+        fallbacks=[
+            CommandHandler("cancel", cancel_conv),
+            CommandHandler("batal", cancel_conv),
+        ],
+    )
+    app.add_handler(settings_conv)
+
+    # Didaftarkan SETELAH settings_conv dengan sengaja: kalau admin sedang di
+    # tengah alur /settings (misalnya state SET_QRIS menunggu upload foto QRIS),
+    # settings_conv harus lebih dulu "mengklaim" pesan foto itu. Kalau tidak ada
+    # percakapan /settings yang aktif, ConversationHandler otomatis tidak match,
+    # dan foto akan jatuh ke sini sebagai bukti transfer normal dari pembeli.
+    #
+    # filters.ChatType.PRIVATE WAJIB ada di sini -- bukti transfer memang hanya
+    # dikirim user lewat chat pribadi dengan bot. Tanpa filter ini, handler juga
+    # ikut ke-trigger untuk foto/media apa pun yang di-upload ke channel/grup
+    # VIP (target_chat_id paket), karena bot jadi admin di sana untuk membuat
+    # invite link -- makanya sebelumnya bot "selalu merespon" tiap ada upload
+    # media di channel itu, padahal itu bukan bukti transfer sama sekali.
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.ChatType.PRIVATE & ~filters.COMMAND, handle_proof_photo
+    ))
+
+    # Pintasan /exportdata -- trigger export manual tanpa perlu buka /settings
+    # dulu. Berdiri sendiri (bukan bagian settings_conv) karena tidak butuh
+    # input lanjutan, cukup langsung jalan & lapor hasil.
+    app.add_handler(CommandHandler("exportdata", cmd_exportdata))
+
+    # /restoredb -- pulihkan dari backup terakhir (otomatis) atau dari file
+    # tertentu (reply ke file .json export). Perlu terima /restoredb yang
+    # dikirim SEBAGAI CAPTION saat upload dokumen juga, makanya di-handle
+    # lewat filters.Document + filters.CaptionRegex selain CommandHandler biasa.
+    app.add_handler(CommandHandler("restoredb", cmd_restoredb))
+    app.add_handler(MessageHandler(
+        filters.Document.FileExtension("json") & filters.CaptionRegex(r"^/restoredb\b"), cmd_restoredb
+    ))
+    app.add_handler(CallbackQueryHandler(restoredb_confirm_cb, pattern="^restoredb_(confirm|cancel)$"))
+    app.add_handler(CommandHandler("autotesti", cmd_autotesti))
+    app.add_handler(CommandHandler("autocollective", cmd_autocollective))
+
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(
+            job_auto_export_tick, interval=3600, first=60, name="auto_export_tick"
+        )
+        # Broadcast & auto-post testimoni berulang -- pola sama seperti
+        # auto-export: dicek tiap jam, jalan beneran hanya kalau sudah
+        # waktunya sesuai interval yang diatur admin lewat /autobroadcast
+        # atau /autotesti.
+        app.job_queue.run_repeating(
+            job_auto_broadcast_tick, interval=3600, first=120, name="auto_broadcast_tick"
+        )
+        app.job_queue.run_repeating(
+            job_auto_testi_tick, interval=3600, first=180, name="auto_testi_tick"
+        )
+        # Kode Promo: rotasi otomatis mingguan (promo_rotate_days) & broadcast
+        # pengingat tiap malam jam promo_broadcast_hour_wib (default 00:00
+        # WIB) -- KEDUA fungsi job-nya (job_promo_rotate_tick &
+        # job_promo_broadcast_tick) sudah lengkap ditulis di atas, tapi
+        # sebelumnya tidak pernah didaftarkan ke job_queue di sini, jadi
+        # rotasi mingguan & broadcast malam TIDAK PERNAH benar-benar jalan
+        # otomatis (kode promo cuma bisa dirotasi manual lewat tombol "🔄
+        # Generate & Post Kode Baru Sekarang" di /settings). Pola sama seperti
+        # job auto-* lain: dicek tiap jam, tapi tiap fungsi punya pengecekan
+        # sendiri kapan waktunya "beneran jalan" (lihat docstring masing-
+        # masing) supaya tidak rotasi/broadcast dobel walau dicek tiap jam.
+        app.job_queue.run_repeating(
+            job_promo_rotate_tick, interval=3600, first=240, name="promo_rotate_tick"
+        )
+        app.job_queue.run_repeating(
+            job_promo_broadcast_tick, interval=3600, first=300, name="promo_broadcast_tick"
+        )
+    else:
+        logger.warning(
+            "job_queue tidak tersedia -- fitur Export Data OTOMATIS, Broadcast "
+            "Berulang, Auto-Post Testimoni, dan Kode Promo (rotasi mingguan +\n"
+            "broadcast malam) semuanya nonaktif. Install dengan: "
+            "pip install \"python-telegram-bot[job-queue]\" untuk mengaktifkannya. "
+            "Perintah manual (/exportdata, /autobroadcast now, /autotesti now, "
+            "tombol \"Generate & Post Kode Baru Sekarang\" di /settings) tetap berfungsi."
+        )
+
+    logger.info("Bot berjalan...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
